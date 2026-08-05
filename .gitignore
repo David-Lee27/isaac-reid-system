@@ -1,0 +1,13 @@
+﻿# Python
+__pycache__/
+*.pyc
+
+# YOLO downloads weights here automatically
+*.pt
+
+# Isaac Sim cache/logs
+*.log
+
+# OS junk
+.DS_Store
+Thumbs.db
