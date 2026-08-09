@@ -1,0 +1,6 @@
+{
+  "/World/Camera1": "Zone_A_NorthEast",
+  "/World/Camera2": "Zone_B_SouthEast",
+  "/World/Camera3": "Zone_C_SouthWest",
+  "/World/Camera4": "Zone_D_NorthWest"
+}

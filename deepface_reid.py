@@ -10,6 +10,8 @@ import sys
 import json
 import os
 
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
 def main():
     if len(sys.argv) < 3:
         print(json.dumps({"error": "usage: deepface_reid.py <image_path> <known_faces_folder>"}))
@@ -35,7 +37,7 @@ def main():
         results = DeepFace.find(
             img_path=image_path,
             db_path=db_path,
-            enforce_detection=False,
+            enforce_detection=True,   # changed from False - diagnostic test
             detector_backend="opencv",
             model_name="Facenet",
             silent=True
