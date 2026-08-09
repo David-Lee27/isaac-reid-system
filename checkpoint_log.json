@@ -1,0 +1,20 @@
+[
+  {
+    "person_id": "ID_0003",
+    "checkpoint": "EntryCamera",
+    "authorized": false,
+    "timestamp": "2026-08-09T04:21:35.739613+00:00"
+  },
+  {
+    "person_id": "ID_0001",
+    "checkpoint": "EntryCamera",
+    "authorized": true,
+    "timestamp": "2026-08-09T04:24:53.010598+00:00"
+  },
+  {
+    "person_id": "ID_0001",
+    "checkpoint": "EntryCamera",
+    "authorized": true,
+    "timestamp": "2026-08-09T04:26:45.416566+00:00"
+  }
+]
