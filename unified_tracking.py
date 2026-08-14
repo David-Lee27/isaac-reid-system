@@ -1,8 +1,10 @@
 r"""
 Unified tracking + movement loop.
 People continuously patrol their waypoint loop WHILE the system sweeps all
-4 zone cameras + checkpoint camera for detection/re-ID/authorization, all
-in one running Isaac Sim instance. Press Ctrl+C to stop.
+4 zone cameras + checkpoint camera for detection/re-ID/authorization/fall
+detection/loitering, all in one running Isaac Sim instance.
+
+Press Ctrl+C to stop.
 
 Run from PowerShell:
     C:\isaacsim\python.bat C:\isaacsim\projects\surveillance-proj\unified_tracking.py
@@ -20,9 +22,10 @@ EVENT_LOG_FILE = PROJECT_DIR + r"\event_log.json"
 CHECKPOINT_NAME = "EntryCamera"
 CHECKPOINT_PATH = "/World/EntryCamera"
 
-SCAN_INTERVAL_SECONDS = 8  # how often to run a full camera sweep
+SCAN_INTERVAL_SECONDS = 8   # how often to run a full camera sweep
+LOITER_THRESHOLD = 3        # consecutive same-zone sightings to flag loitering
 
-# --- People + patrol path (from move_people.py) ---
+# --- People + patrol path ---
 PEOPLE = {
     "Person1": {"prim_path": "/World/male_adult_police_04",          "start_delay": 0},
     "Person2": {"prim_path": "/World/male_adult_construction_03",     "start_delay": 5},
@@ -39,7 +42,7 @@ WAYPOINTS = [
     (29.9, 13.4, 0),
 ]
 SECONDS_PER_LEG = 4
-LOOP_PATROL = True  # once they finish the path, start over from the beginning
+LOOP_PATROL = True
 
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": HEADLESS})
@@ -193,6 +196,36 @@ def crop_person(bgr_image, detection, padding=25):
     return bgr_image[y1:y2, x1:x2]
 
 
+def check_for_fall(detection):
+    """A standing person's bounding box is taller than wide. A fallen
+    person's box becomes wider than tall. Reuses the YOLO detection we
+    already computed - no extra model needed."""
+    width = detection["x2"] - detection["x1"]
+    height = detection["y2"] - detection["y1"]
+    if height == 0:
+        return False
+    aspect_ratio = width / height
+    return aspect_ratio > 1.3
+
+
+def check_loitering(zone_name, person_id, threshold=LOITER_THRESHOLD):
+    """Flags loitering if the same person was logged in the same zone for
+    the last `threshold` consecutive zone-type log entries for that zone."""
+    if not os.path.exists(EVENT_LOG_FILE):
+        return False
+    with open(EVENT_LOG_FILE, "r") as f:
+        try:
+            log = json.load(f)
+        except json.JSONDecodeError:
+            return False
+
+    zone_entries = [e for e in log if e.get("event_type") == "zone" and e.get("zone") == zone_name]
+    recent = zone_entries[-threshold:]
+    if len(recent) < threshold:
+        return False
+    return all(e["person_id"] == person_id for e in recent)
+
+
 def scan_zone_camera(camera_path, zone_name):
     print(f"  scanning {zone_name}...")
     bgr = capture_frame(camera_path)
@@ -212,6 +245,16 @@ def scan_zone_camera(camera_path, zone_name):
         return None
 
     best_detection = max(detections, key=lambda d: d["confidence"])
+
+    if check_for_fall(best_detection):
+        print(f"  [{zone_name}] *** FALL DETECTED ***")
+        append_log_entry({
+            "event_type": "fall_alert",
+            "zone": zone_name,
+            "camera": camera_path,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+
     crop = crop_person(bgr, best_detection)
     if crop.size == 0:
         return {"error": "empty crop"}
@@ -241,6 +284,16 @@ def scan_checkpoint(authorized_ids):
         return
 
     best_detection = max(detections, key=lambda d: d["confidence"])
+
+    if check_for_fall(best_detection):
+        print(f"  [CHECKPOINT] *** FALL DETECTED ***")
+        append_log_entry({
+            "event_type": "fall_alert",
+            "zone": "CHECKPOINT",
+            "camera": CHECKPOINT_PATH,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+
     crop = crop_person(bgr, best_detection)
     if crop.size == 0:
         return
@@ -249,7 +302,6 @@ def scan_checkpoint(authorized_ids):
     cv2.imwrite(crop_path, crop)
     reid_result = run_subprocess("deepface_reid.py", [crop_path, KNOWN_FACES_DIR])
 
-    
     person_id = None
     status = reid_result.get("status")
 
@@ -287,10 +339,23 @@ def run_sweep(camera_zones, authorized_ids):
         if result.get("error"):
             print(f"  [{zone_name}] error: {result['error']}")
             continue
-        print(f"  [{zone_name}] {result['person_id']}")
+
+        person_id = result["person_id"]
+        print(f"  [{zone_name}] {person_id}")
+
+        if person_id not in (None, "unidentified"):
+            if check_loitering(zone_name, person_id):
+                print(f"  [{zone_name}] *** LOITERING: {person_id} ***")
+                append_log_entry({
+                    "event_type": "loitering_alert",
+                    "person_id": person_id,
+                    "zone": zone_name,
+                    "timestamp": timestamp
+                })
+
         append_log_entry({
             "event_type": "zone",
-            "person_id": result["person_id"],
+            "person_id": person_id,
             "zone": zone_name,
             "camera": camera_path,
             "timestamp": timestamp
@@ -318,7 +383,6 @@ def main():
     for _ in range(20):
         simulation_app.update()
 
-    # Set up movers
     movers = []
     for name, info in PEOPLE.items():
         prim = stage.GetPrimAtPath(info["prim_path"])
@@ -341,12 +405,10 @@ def main():
         while True:
             elapsed = time.time() - sim_start
 
-            # Continuously advance people along their patrol path
             for m in movers:
                 update_person_position(m, elapsed)
             simulation_app.update()
 
-            # Periodically run a full camera sweep
             if elapsed - last_sweep_time >= SCAN_INTERVAL_SECONDS:
                 authorized_ids = load_authorized_ids()
                 run_sweep(camera_zones, authorized_ids)

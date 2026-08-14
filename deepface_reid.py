@@ -1,4 +1,4 @@
-"""
+r"""
 Runs DeepFace re-identification: checks if the face in the given image
 matches a known person in the known_faces/ database.
 
@@ -28,10 +28,6 @@ def main():
 
     from deepface import DeepFace
 
-    has_known_faces = any(
-        f.lower().endswith((".jpg", ".jpeg", ".png"))
-        for f in os.listdir(db_path)
-    ) if os.path.isdir(db_path) else False
     # Delete any stale DeepFace cache files before searching - we're actively
     # adding new reference images between calls, and a stale cache can cause
     # real matches to be silently missed.
@@ -39,6 +35,12 @@ def main():
         for f in os.listdir(db_path):
             if f.endswith(".pkl"):
                 os.remove(os.path.join(db_path, f))
+
+    has_known_faces = any(
+        f.lower().endswith((".jpg", ".jpeg", ".png"))
+        for f in os.listdir(db_path)
+    ) if os.path.isdir(db_path) else False
+
     # First, confirm a face can even be detected in this image at all,
     # independent of whether it matches anyone known.
     try:
