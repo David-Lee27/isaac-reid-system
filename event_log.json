@@ -474,5 +474,123 @@
     "zone": "Zone_B_SouthEast",
     "camera": "/World/Camera2",
     "timestamp": "2026-08-14T00:01:53.325657+00:00"
+  },
+  {
+    "event_type": "zone",
+    "person_id": "unidentified",
+    "zone": "Zone_A_NorthEast",
+    "camera": "/World/Camera1",
+    "timestamp": "2026-08-14T00:14:46.298204+00:00"
+  },
+  {
+    "event_type": "checkpoint",
+    "person_id": "ID_0001",
+    "checkpoint": "EntryCamera",
+    "authorized": true,
+    "timestamp": "2026-08-14T00:15:36.745964+00:00"
+  },
+  {
+    "event_type": "zone",
+    "person_id": "unidentified",
+    "zone": "Zone_A_NorthEast",
+    "camera": "/World/Camera1",
+    "timestamp": "2026-08-14T00:15:36.795503+00:00"
+  },
+  {
+    "event_type": "checkpoint",
+    "person_id": "ID_0001",
+    "checkpoint": "EntryCamera",
+    "authorized": true,
+    "timestamp": "2026-08-14T00:16:06.469552+00:00"
+  },
+  {
+    "event_type": "checkpoint",
+    "person_id": "ID_0002",
+    "checkpoint": "EntryCamera",
+    "authorized": false,
+    "timestamp": "2026-08-14T00:16:30.835931+00:00"
+  },
+  {
+    "event_type": "zone",
+    "person_id": "unidentified",
+    "zone": "Zone_A_NorthEast",
+    "camera": "/World/Camera1",
+    "timestamp": "2026-08-14T00:16:30.885668+00:00"
+  },
+  {
+    "event_type": "checkpoint",
+    "person_id": "ID_0003",
+    "checkpoint": "EntryCamera",
+    "authorized": false,
+    "timestamp": "2026-08-14T00:17:01.470644+00:00"
+  },
+  {
+    "event_type": "checkpoint",
+    "person_id": "ID_0002",
+    "checkpoint": "EntryCamera",
+    "authorized": false,
+    "timestamp": "2026-08-14T00:17:27.272847+00:00"
+  },
+  {
+    "event_type": "zone",
+    "person_id": "unidentified",
+    "zone": "Zone_A_NorthEast",
+    "camera": "/World/Camera1",
+    "timestamp": "2026-08-14T00:17:27.321885+00:00"
+  },
+  {
+    "event_type": "zone",
+    "person_id": "unidentified",
+    "zone": "Zone_A_NorthEast",
+    "camera": "/World/Camera1",
+    "timestamp": "2026-08-14T00:21:18.247667+00:00"
+  },
+  {
+    "event_type": "checkpoint",
+    "person_id": "ID_0001",
+    "checkpoint": "EntryCamera",
+    "authorized": true,
+    "timestamp": "2026-08-14T00:21:52.366736+00:00"
+  },
+  {
+    "event_type": "zone",
+    "person_id": "unidentified",
+    "zone": "Zone_D_NorthWest",
+    "camera": "/World/Camera4",
+    "timestamp": "2026-08-14T00:21:52.424288+00:00"
+  },
+  {
+    "event_type": "zone",
+    "person_id": "unidentified",
+    "zone": "Zone_A_NorthEast",
+    "camera": "/World/Camera1",
+    "timestamp": "2026-08-14T00:22:13.772772+00:00"
+  },
+  {
+    "event_type": "checkpoint",
+    "person_id": "ID_0001",
+    "checkpoint": "EntryCamera",
+    "authorized": true,
+    "timestamp": "2026-08-14T00:22:45.916410+00:00"
+  },
+  {
+    "event_type": "zone",
+    "person_id": "ID_0003",
+    "zone": "Zone_A_NorthEast",
+    "camera": "/World/Camera1",
+    "timestamp": "2026-08-14T00:22:45.965449+00:00"
+  },
+  {
+    "event_type": "zone",
+    "person_id": "ID_0003",
+    "zone": "Zone_D_NorthWest",
+    "camera": "/World/Camera4",
+    "timestamp": "2026-08-14T00:22:45.965449+00:00"
+  },
+  {
+    "event_type": "fall_alert",
+    "zone": "CHECKPOINT",
+    "camera": "/World/EntryCamera",
+    "timestamp": "2026-08-14T00:23:22.132607+00:00"
   }
 ]

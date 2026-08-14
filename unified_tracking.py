@@ -18,6 +18,7 @@ ID_COUNTER_FILE = PROJECT_DIR + r"\next_id.txt"
 CAMERA_ZONES_FILE = PROJECT_DIR + r"\camera_zones.json"
 AUTHORIZED_IDS_FILE = PROJECT_DIR + r"\authorized_ids.json"
 EVENT_LOG_FILE = PROJECT_DIR + r"\event_log.json"
+DEBUG_DIR = PROJECT_DIR + r"\debug_captures"
 
 CHECKPOINT_NAME = "EntryCamera"
 CHECKPOINT_PATH = "/World/EntryCamera"
@@ -54,6 +55,7 @@ import cv2
 import subprocess
 import json
 import os
+import shutil
 import time
 from datetime import datetime, timezone
 from isaacsim.sensors.camera import Camera
@@ -205,6 +207,7 @@ def check_for_fall(detection):
     if height == 0:
         return False
     aspect_ratio = width / height
+    print(f"    (aspect ratio: {aspect_ratio:.2f}, fall threshold is 1.3)")
     return aspect_ratio > 1.3
 
 
@@ -262,6 +265,9 @@ def scan_zone_camera(camera_path, zone_name):
     crop_path = os.path.join(os.environ["TEMP"], f"crop_{tag}.jpg")
     cv2.imwrite(crop_path, crop)
 
+    debug_name = f"{datetime.now().strftime('%H%M%S')}_{tag}_crop.jpg"
+    cv2.imwrite(os.path.join(DEBUG_DIR, debug_name), crop)
+
     reid_result = run_subprocess("deepface_reid.py", [crop_path, KNOWN_FACES_DIR])
     if reid_result.get("status") == "match":
         matched_filename = os.path.basename(reid_result["matched_path"])
@@ -300,6 +306,10 @@ def scan_checkpoint(authorized_ids):
 
     crop_path = os.path.join(os.environ["TEMP"], "checkpoint_crop.jpg")
     cv2.imwrite(crop_path, crop)
+
+    debug_name = f"{datetime.now().strftime('%H%M%S')}_checkpoint_crop.jpg"
+    cv2.imwrite(os.path.join(DEBUG_DIR, debug_name), crop)
+
     reid_result = run_subprocess("deepface_reid.py", [crop_path, KNOWN_FACES_DIR])
 
     person_id = None
@@ -368,6 +378,12 @@ def run_sweep(camera_zones, authorized_ids):
 
 def main():
     os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
+
+    # Clear out the debug folder from the previous run so it doesn't pile up,
+    # then recreate it fresh for this run's captures.
+    if os.path.exists(DEBUG_DIR):
+        shutil.rmtree(DEBUG_DIR)
+    os.makedirs(DEBUG_DIR, exist_ok=True)
 
     with open(CAMERA_ZONES_FILE, "r") as f:
         camera_zones = json.load(f)
