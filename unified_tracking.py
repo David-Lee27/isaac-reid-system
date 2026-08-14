@@ -19,6 +19,8 @@ CAMERA_ZONES_FILE = PROJECT_DIR + r"\camera_zones.json"
 AUTHORIZED_IDS_FILE = PROJECT_DIR + r"\authorized_ids.json"
 EVENT_LOG_FILE = PROJECT_DIR + r"\event_log.json"
 DEBUG_DIR = PROJECT_DIR + r"\debug_captures"
+APPEARANCE_PROFILES_FILE = PROJECT_DIR + r"\appearance_profiles.json"
+APPEARANCE_MATCH_THRESHOLD = 0.7   # HSV histogram correlation, 0-1, higher = stricter
 
 CHECKPOINT_NAME = "EntryCamera"
 CHECKPOINT_PATH = "/World/EntryCamera"
@@ -45,6 +47,23 @@ WAYPOINTS = [
 SECONDS_PER_LEG = 4
 LOOP_PATROL = True
 
+# --- Randomized loitering test ---
+# One random person gets assigned a random window during the run where,
+# instead of patrolling, they wander in small circles near a random zone -
+# a realistic test of the loitering detector instead of manually posing someone.
+LOITER_ENABLED = True
+LOITER_START_RANGE = (20, 50)      # seconds into the run it can begin
+LOITER_DURATION_RANGE = (25, 40)   # how long they wander before resuming patrol
+LOITER_RADIUS = 2.0                # meters, how far they wander from the center point
+
+# Zone camera positions, reused as loiter centers (from earlier camera placement)
+ZONE_CENTERS = {
+    "Zone_A_NorthEast": (28.67, 28.73),
+    "Zone_B_SouthEast": (28.97, -7.97),
+    "Zone_C_SouthWest": (-28.71, -9.28),
+    "Zone_D_NorthWest": (-28.7, 28.73),
+}
+
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": HEADLESS})
 
@@ -52,11 +71,14 @@ import omni.usd
 import omni.timeline
 from pxr import Gf, UsdGeom, UsdPhysics
 import cv2
+import numpy as np
 import subprocess
 import json
 import os
 import shutil
 import time
+import random
+import math
 from datetime import datetime, timezone
 from isaacsim.sensors.camera import Camera
 import carb
@@ -94,6 +116,18 @@ def disable_physics_recursive(prim):
 
 
 def update_person_position(mover, elapsed):
+    # If this mover is in their assigned loiter window, wander in small
+    # circles near the loiter center instead of following the patrol path.
+    loiter_start = mover.get("loiter_start")
+    if loiter_start is not None:
+        loiter_end = loiter_start + mover["loiter_duration"]
+        if loiter_start <= elapsed <= loiter_end:
+            cx, cy = mover["loiter_center"]
+            x = cx + LOITER_RADIUS * math.sin(elapsed * 0.7)
+            y = cy + LOITER_RADIUS * math.cos(elapsed * 0.5)
+            set_translate(mover["prim"], (x, y, 0))
+            return
+
     personal_elapsed = elapsed - mover["start_delay"]
     if personal_elapsed < 0:
         return
@@ -198,6 +232,59 @@ def crop_person(bgr_image, detection, padding=25):
     return bgr_image[y1:y2, x1:x2]
 
 
+def extract_appearance_signature(crop):
+    """Computes a normalized HSV color histogram of the crop, used as a
+    lightweight 'what are they wearing' fingerprint - a fallback identity
+    signal for when face detection fails (common on wide zone cameras)."""
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1, 2], None, [8, 8, 8], [0, 180, 0, 256, 0, 256])
+    hist = cv2.normalize(hist, hist).flatten()
+    return hist.tolist()
+
+
+def compare_appearance(sig1, sig2):
+    h1 = np.array(sig1, dtype=np.float32)
+    h2 = np.array(sig2, dtype=np.float32)
+    return cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL)
+
+
+def load_appearance_profiles():
+    if not os.path.exists(APPEARANCE_PROFILES_FILE):
+        return {}
+    with open(APPEARANCE_PROFILES_FILE, "r") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return {}
+
+
+def save_appearance_profile(person_id, crop):
+    """Called whenever we have a CONFIRMED identity (from a face match/new
+    at the checkpoint) - records what they're wearing so zone cameras can
+    recognize them later even without a clean face shot."""
+    profiles = load_appearance_profiles()
+    profiles[person_id] = extract_appearance_signature(crop)
+    with open(APPEARANCE_PROFILES_FILE, "w") as f:
+        json.dump(profiles, f)
+
+
+def find_appearance_match(crop, threshold=APPEARANCE_MATCH_THRESHOLD):
+    """Compares this crop's color signature against all known appearance
+    profiles. Returns (person_id, score) for the best match above threshold,
+    or (None, None) if nothing matches closely enough."""
+    profiles = load_appearance_profiles()
+    if not profiles:
+        return None, None
+
+    sig = extract_appearance_signature(crop)
+    best_id, best_score = None, threshold
+    for pid, known_sig in profiles.items():
+        score = compare_appearance(sig, known_sig)
+        if score > best_score:
+            best_id, best_score = pid, score
+    return (best_id, best_score) if best_id else (None, None)
+
+
 def check_for_fall(detection):
     """A standing person's bounding box is taller than wide. A fallen
     person's box becomes wider than tall. Reuses the YOLO detection we
@@ -211,9 +298,11 @@ def check_for_fall(detection):
     return aspect_ratio > 1.3
 
 
-def check_loitering(zone_name, person_id, threshold=LOITER_THRESHOLD):
-    """Flags loitering if the same person was logged in the same zone for
-    the last `threshold` consecutive zone-type log entries for that zone."""
+def check_loitering(zone_name, threshold=LOITER_THRESHOLD):
+    """Flags loitering if SOMEONE (not necessarily positively identified -
+    zone camera face reads are unreliable, so we key on presence, not
+    identity match) was detected in this zone for the last `threshold`
+    consecutive zone-type log entries for that zone."""
     if not os.path.exists(EVENT_LOG_FILE):
         return False
     with open(EVENT_LOG_FILE, "r") as f:
@@ -226,7 +315,9 @@ def check_loitering(zone_name, person_id, threshold=LOITER_THRESHOLD):
     recent = zone_entries[-threshold:]
     if len(recent) < threshold:
         return False
-    return all(e["person_id"] == person_id for e in recent)
+    # Every recent sweep of this zone found SOMEONE present (not "nobody"),
+    # regardless of whether we could confirm who.
+    return all(e.get("person_id") is not None for e in recent)
 
 
 def scan_zone_camera(camera_path, zone_name):
@@ -271,8 +362,14 @@ def scan_zone_camera(camera_path, zone_name):
     reid_result = run_subprocess("deepface_reid.py", [crop_path, KNOWN_FACES_DIR])
     if reid_result.get("status") == "match":
         matched_filename = os.path.basename(reid_result["matched_path"])
-        return {"person_id": os.path.splitext(matched_filename)[0], "distance": reid_result["distance"]}
+        person_id = os.path.splitext(matched_filename)[0]
+        return {"person_id": person_id, "distance": reid_result["distance"], "match_type": "face"}
     else:
+        # Face detection failed or didn't match - fall back to clothing/color
+        # signature, which is far more reliable from wide zone camera angles.
+        appearance_id, appearance_score = find_appearance_match(crop)
+        if appearance_id:
+            return {"person_id": appearance_id, "score": appearance_score, "match_type": "clothing"}
         return {"person_id": "unidentified", "reason": reid_result.get("reason", "no match")}
 
 
@@ -327,6 +424,10 @@ def scan_checkpoint(authorized_ids):
         print(f"  [CHECKPOINT] face detection failed, skipping: {reid_result.get('reason')}")
 
     if person_id:
+        # Face confirmed their identity here, so this is a trustworthy moment
+        # to record/update their clothing signature for zone cameras to use.
+        save_appearance_profile(person_id, crop)
+
         is_authorized = person_id in authorized_ids
         print(f"  [CHECKPOINT] {person_id} -> {'AUTHORIZED' if is_authorized else 'NOT AUTHORIZED'}")
         append_log_entry({
@@ -351,17 +452,18 @@ def run_sweep(camera_zones, authorized_ids):
             continue
 
         person_id = result["person_id"]
-        print(f"  [{zone_name}] {person_id}")
+        match_type = result.get("match_type", "none")
+        tag = f" (via {match_type})" if match_type != "none" else ""
+        print(f"  [{zone_name}] {person_id}{tag}")
 
-        if person_id not in (None, "unidentified"):
-            if check_loitering(zone_name, person_id):
-                print(f"  [{zone_name}] *** LOITERING: {person_id} ***")
-                append_log_entry({
-                    "event_type": "loitering_alert",
-                    "person_id": person_id,
-                    "zone": zone_name,
-                    "timestamp": timestamp
-                })
+        if check_loitering(zone_name):
+            print(f"  [{zone_name}] *** LOITERING (someone present {LOITER_THRESHOLD}+ sweeps in a row) ***")
+            append_log_entry({
+                "event_type": "loitering_alert",
+                "person_id": person_id,
+                "zone": zone_name,
+                "timestamp": timestamp
+            })
 
         append_log_entry({
             "event_type": "zone",
@@ -409,8 +511,17 @@ def main():
         start = get_translate(prim)
         full_path = [(start[0], start[1], start[2])] + WAYPOINTS
         movers.append({
-            "name": name, "prim": prim, "path": full_path, "start_delay": info["start_delay"]
+            "name": name, "prim": prim, "path": full_path, "start_delay": info["start_delay"],
+            "loiter_start": None, "loiter_duration": None, "loiter_center": None
         })
+
+    if LOITER_ENABLED and movers:
+        loiterer = random.choice(movers)
+        loiterer["loiter_start"] = random.uniform(*LOITER_START_RANGE)
+        loiterer["loiter_duration"] = random.uniform(*LOITER_DURATION_RANGE)
+        loiterer["loiter_center"] = random.choice(list(ZONE_CENTERS.values()))
+        print(f"*** {loiterer['name']} will loiter near {loiterer['loiter_center']} "
+              f"starting at t={loiterer['loiter_start']:.1f}s for {loiterer['loiter_duration']:.1f}s ***")
 
     print("=== Unified tracking + movement loop started. Press Ctrl+C to stop. ===")
 
