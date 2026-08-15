@@ -298,26 +298,22 @@ def check_for_fall(detection):
     return aspect_ratio > 1.3
 
 
-def check_loitering(zone_name, threshold=LOITER_THRESHOLD):
-    """Flags loitering if SOMEONE (not necessarily positively identified -
-    zone camera face reads are unreliable, so we key on presence, not
-    identity match) was detected in this zone for the last `threshold`
-    consecutive zone-type log entries for that zone."""
-    if not os.path.exists(EVENT_LOG_FILE):
-        return False
-    with open(EVENT_LOG_FILE, "r") as f:
-        try:
-            log = json.load(f)
-        except json.JSONDecodeError:
-            return False
+def check_loitering(zone_name, streak_state, threshold=LOITER_THRESHOLD):
+    """Tracks a live consecutive-presence streak per zone, in memory, across
+    sweeps. A sweep that finds someone in the zone increments the streak;
+    a sweep that finds nobody resets it to zero. This correctly captures
+    'someone has been continuously here' rather than 'someone has been
+    spotted here a few times' (which the old log-based version conflated,
+    since empty sweeps were never logged and gaps between different people
+    passing through looked identical to one person staying put).
 
-    zone_entries = [e for e in log if e.get("event_type") == "zone" and e.get("zone") == zone_name]
-    recent = zone_entries[-threshold:]
-    if len(recent) < threshold:
-        return False
-    # Every recent sweep of this zone found SOMEONE present (not "nobody"),
-    # regardless of whether we could confirm who.
-    return all(e.get("person_id") is not None for e in recent)
+    Also only fires the alert once per streak (not every sweep past the
+    threshold) via an 'alerted' flag that resets alongside the streak.
+    """
+    if streak_state[zone_name]["streak"] >= threshold and not streak_state[zone_name]["alerted"]:
+        streak_state[zone_name]["alerted"] = True
+        return True
+    return False
 
 
 def scan_zone_camera(camera_path, zone_name):
@@ -346,6 +342,14 @@ def scan_zone_camera(camera_path, zone_name):
             "event_type": "fall_alert",
             "zone": zone_name,
             "camera": camera_path,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+        append_log_entry({
+            "event_type": "dispatch_alert",
+            "reason": "fall",
+            "person_id": None,
+            "zone": zone_name,
+            "coords": ZONE_CENTERS.get(zone_name),
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
 
@@ -439,29 +443,61 @@ def scan_checkpoint(authorized_ids):
         })
 
 
-def run_sweep(camera_zones, authorized_ids):
+def run_sweep(camera_zones, authorized_ids, streak_state):
     timestamp = datetime.now(timezone.utc).isoformat()
     print(f"\n--- Sweep at {timestamp} ---")
 
     for camera_path, zone_name in camera_zones.items():
         result = scan_zone_camera(camera_path, zone_name)
-        if result is None:
+
+        if result is None or result.get("error"):
+            # Nobody detected (or a scan error) - the presence streak breaks here.
+            streak_state[zone_name]["streak"] = 0
+            streak_state[zone_name]["alerted"] = False
+            if result and result.get("error"):
+                print(f"  [{zone_name}] error: {result['error']}")
             continue
-        if result.get("error"):
-            print(f"  [{zone_name}] error: {result['error']}")
-            continue
+
+        streak_state[zone_name]["streak"] += 1
 
         person_id = result["person_id"]
         match_type = result.get("match_type", "none")
         tag = f" (via {match_type})" if match_type != "none" else ""
         print(f"  [{zone_name}] {person_id}{tag}")
 
-        if check_loitering(zone_name):
+        # Authorization check happens here too, not just at the checkpoint -
+        # if we know who someone is (via face OR clothing) and they're not
+        # on the authorized list, that's a dispatchable alert with a real
+        # location attached for the robot to go investigate/double-check.
+        if person_id not in (None, "unidentified") and person_id not in authorized_ids:
+            coords = ZONE_CENTERS.get(zone_name)
+            print(f"  [{zone_name}] *** UNAUTHORIZED PRESENCE: {person_id} - dispatch coords {coords} ***")
+            append_log_entry({
+                "event_type": "dispatch_alert",
+                "reason": "unauthorized_zone_presence",
+                "person_id": person_id,
+                "zone": zone_name,
+                "coords": coords,
+                "match_type": match_type,
+                "timestamp": timestamp
+            })
+
+        if check_loitering(zone_name, streak_state):
+            coords = ZONE_CENTERS.get(zone_name)
             print(f"  [{zone_name}] *** LOITERING (someone present {LOITER_THRESHOLD}+ sweeps in a row) ***")
             append_log_entry({
                 "event_type": "loitering_alert",
                 "person_id": person_id,
                 "zone": zone_name,
+                "coords": coords,
+                "timestamp": timestamp
+            })
+            append_log_entry({
+                "event_type": "dispatch_alert",
+                "reason": "loitering",
+                "person_id": person_id,
+                "zone": zone_name,
+                "coords": coords,
                 "timestamp": timestamp
             })
 
@@ -515,6 +551,10 @@ def main():
             "loiter_start": None, "loiter_duration": None, "loiter_center": None
         })
 
+    # Live per-zone loitering streak tracker, persists across sweeps for the
+    # whole run - see check_loitering() for why this replaced a log-based check.
+    streak_state = {zone_name: {"streak": 0, "alerted": False} for zone_name in camera_zones.values()}
+
     if LOITER_ENABLED and movers:
         loiterer = random.choice(movers)
         loiterer["loiter_start"] = random.uniform(*LOITER_START_RANGE)
@@ -538,7 +578,7 @@ def main():
 
             if elapsed - last_sweep_time >= SCAN_INTERVAL_SECONDS:
                 authorized_ids = load_authorized_ids()
-                run_sweep(camera_zones, authorized_ids)
+                run_sweep(camera_zones, authorized_ids, streak_state)
                 last_sweep_time = elapsed
 
     except KeyboardInterrupt:
