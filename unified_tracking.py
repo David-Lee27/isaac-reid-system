@@ -64,6 +64,41 @@ ZONE_CENTERS = {
     "Zone_D_NorthWest": (-28.7, 28.73),
 }
 
+# --- Robot dispatch ---
+# The robot patrols on its own loop by default. Periodically it checks the
+# event log for unhandled dispatch_alert entries (from fall/loitering/
+# unauthorized-presence detections). If one exists, it drives to that
+# alert's coordinates, runs a checkpoint-style face-ID scan on arrival to
+# double-check the person's identity/authorization, then resumes patrol.
+ROBOT_PRIM_PATH = "/World/mobile_manipulator_ros"
+ROBOT_BASE_PATH = "/World/mobile_manipulator_ros/base_footprint"  # actual physics-driven prim - moving the outer group prim does nothing, PhysX drives this child directly
+ROBOT_CAMERA_PATH = "/World/mobile_manipulator_ros/camera_front/Gemini335L/Gemini335L/camera_rgb/Camera_rgb"
+ROBOT_SPEED = 3.0             # meters per second
+ROBOT_CHECK_INTERVAL = 3.0    # seconds between checking for new dispatch alerts while patrolling
+
+# Robot gets its own patrol loop, pulled in from the walls compared to the
+# people's path - it's a bigger vehicle and (being kinematic) doesn't get
+# physically stopped by collisions, it'll just visually clip through walls
+# if driven too close to them.
+ROBOT_WAYPOINTS = [
+    (20, 20, 0),
+    (20, 0, 0),
+    (-20, 0, 0),
+    (-20, 20, 0),
+]
+
+# base_footprint is the only prim with a real physics-driven root, but
+# camera_front, camera_hand_link, wheel_left, wheel_right are SIBLINGS of
+# base_footprint (not children!) under the top-level robot group - moving
+# base_footprint does NOT bring them along. We move them manually as a
+# rigid group, preserving their original offset from base_footprint.
+ROBOT_FOLLOWER_PATHS = [
+    "/World/mobile_manipulator_ros/camera_front",
+    "/World/mobile_manipulator_ros/camera_hand_link",
+    "/World/mobile_manipulator_ros/wheel_left",
+    "/World/mobile_manipulator_ros/wheel_right",
+]
+
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": HEADLESS})
 
@@ -154,6 +189,144 @@ def update_person_position(mover, elapsed):
         p1[2] + (p2[2] - p1[2]) * leg_t,
     )
     set_translate(mover["prim"], new_pos)
+
+
+def move_toward(current, target, step):
+    """Moves `current` (x,y) toward `target` (x,y) by up to `step` distance.
+    Returns (new_position, arrived_bool). Used for the robot's dispatch and
+    patrol movement, which - unlike the people's fixed-time-per-leg
+    interpolation - moves at a constant real-world speed."""
+    dx = target[0] - current[0]
+    dy = target[1] - current[1]
+    dist = math.hypot(dx, dy)
+    if dist <= step or dist < 0.05:
+        return (target[0], target[1], 0), True
+    ratio = step / dist
+    return (current[0] + dx * ratio, current[1] + dy * ratio, 0), False
+
+
+def find_next_unhandled_alert(handled_timestamps):
+    """Reads the event log for the oldest dispatch_alert that has real
+    coordinates and hasn't already been handled by the robot this run."""
+    if not os.path.exists(EVENT_LOG_FILE):
+        return None
+    with open(EVENT_LOG_FILE, "r") as f:
+        try:
+            log = json.load(f)
+        except json.JSONDecodeError:
+            return None
+    for e in log:
+        if (e.get("event_type") == "dispatch_alert"
+                and e.get("coords")
+                and e.get("timestamp") not in handled_timestamps):
+            return e
+    return None
+
+
+def scan_robot(camera_path, authorized_ids, alert):
+    """Robot's on-arrival scan: same YOLO -> crop -> DeepFace -> authorization
+    pipeline as the fixed checkpoint camera, but mobile - this is the actual
+    'double-check' behavior: a zone camera flagged something, the robot goes
+    there and confirms identity/authorization up close."""
+    print(f"  [ROBOT] arrived at {alert['zone']} ({alert['reason']}) - scanning...")
+    bgr = capture_frame(camera_path, resolution=(1280, 720))
+    if bgr is None:
+        print("  [ROBOT] no frame captured")
+        return
+
+    frame_path = os.path.join(os.environ["TEMP"], "robot_scan.jpg")
+    cv2.imwrite(frame_path, bgr)
+    yolo_result = run_subprocess("yolo_detect.py", [frame_path])
+    detections = yolo_result.get("detections", []) if not yolo_result.get("error") else []
+    if not detections:
+        print("  [ROBOT] nobody found at the alert location")
+        append_log_entry({
+            "event_type": "robot_response", "found": False,
+            "alert_reason": alert.get("reason"), "zone": alert.get("zone"),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+        return
+
+    best_detection = max(detections, key=lambda d: d["confidence"])
+    crop = crop_person(bgr, best_detection)
+    if crop.size == 0:
+        return
+
+    crop_path = os.path.join(os.environ["TEMP"], "robot_crop.jpg")
+    cv2.imwrite(crop_path, crop)
+    debug_name = f"{datetime.now().strftime('%H%M%S')}_robot_crop.jpg"
+    cv2.imwrite(os.path.join(DEBUG_DIR, debug_name), crop)
+
+    reid_result = run_subprocess("deepface_reid.py", [crop_path, KNOWN_FACES_DIR])
+    status = reid_result.get("status")
+    person_id = None
+
+    if status == "match":
+        matched_filename = os.path.basename(reid_result["matched_path"])
+        person_id = os.path.splitext(matched_filename)[0]
+        print(f"  [ROBOT] confirmed identity: {person_id}")
+    elif status == "new":
+        person_id = f"ID_{get_next_id():04d}"
+        cv2.imwrite(os.path.join(KNOWN_FACES_DIR, f"{person_id}.jpg"), crop)
+        print(f"  [ROBOT] new person found on-site: {person_id}")
+    else:
+        print(f"  [ROBOT] could not get a clear face: {reid_result.get('reason')}")
+
+    if person_id:
+        save_appearance_profile(person_id, crop)
+        is_authorized = person_id in authorized_ids
+        print(f"  [ROBOT] double-check result: {person_id} -> {'AUTHORIZED' if is_authorized else 'NOT AUTHORIZED'}")
+        append_log_entry({
+            "event_type": "robot_response", "found": True,
+            "person_id": person_id, "authorized": is_authorized,
+            "alert_reason": alert.get("reason"), "zone": alert.get("zone"),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+
+
+def move_followers(robot_state, base_new_pos):
+    """Moves camera_front/wheel_left/wheel_right/camera_hand_link to keep
+    their original offset from base_footprint's new position - they don't
+    move on their own since they're siblings, not children, of base_footprint."""
+    for follower in robot_state["followers"]:
+        offset = follower["offset"]
+        new_pos = (base_new_pos[0] + offset[0], base_new_pos[1] + offset[1], base_new_pos[2] + offset[2])
+        set_translate(follower["prim"], new_pos)
+
+
+def update_robot(robot_state, elapsed, dt, authorized_ids):
+    if robot_state["mode"] == "patrol" and elapsed - robot_state["last_check"] >= ROBOT_CHECK_INTERVAL:
+        robot_state["last_check"] = elapsed
+        alert = find_next_unhandled_alert(robot_state["handled_timestamps"])
+        if alert:
+            robot_state["mode"] = "dispatched"
+            robot_state["target"] = alert["coords"]
+            robot_state["handling_alert"] = alert
+            print(f"\n*** ROBOT DISPATCHED: {alert['reason']} in {alert['zone']} at {alert['coords']} ***")
+
+    current = robot_state["position"]
+    distance_step = ROBOT_SPEED * dt
+
+    if robot_state["mode"] == "dispatched":
+        new_pos, arrived = move_toward(current, robot_state["target"], distance_step)
+        robot_state["position"] = new_pos
+        set_translate(robot_state["prim"], new_pos)
+        move_followers(robot_state, new_pos)
+        if arrived:
+            alert = robot_state["handling_alert"]
+            scan_robot(ROBOT_CAMERA_PATH, authorized_ids, alert)
+            robot_state["handled_timestamps"].add(alert["timestamp"])
+            robot_state["mode"] = "patrol"
+            robot_state["target"] = None
+            robot_state["handling_alert"] = None
+    else:
+        target = ROBOT_WAYPOINTS[robot_state["patrol_index"]]
+        new_pos, arrived = move_toward(current, target, distance_step)
+        robot_state["position"] = new_pos
+        set_translate(robot_state["prim"], new_pos)
+        move_followers(robot_state, new_pos)
+        if arrived:
+            robot_state["patrol_index"] = (robot_state["patrol_index"] + 1) % len(ROBOT_WAYPOINTS)
 
 
 # ---------- Tracking helpers ----------
@@ -532,10 +705,6 @@ def main():
         simulation_app.update()
 
     stage = usd_context.get_stage()
-    timeline = omni.timeline.get_timeline_interface()
-    timeline.play()
-    for _ in range(20):
-        simulation_app.update()
 
     movers = []
     for name, info in PEOPLE.items():
@@ -550,6 +719,61 @@ def main():
             "name": name, "prim": prim, "path": full_path, "start_delay": info["start_delay"],
             "loiter_start": None, "loiter_duration": None, "loiter_center": None
         })
+
+    # --- Robot setup ---
+    # IMPORTANT: kinematic flags must be set BEFORE timeline.play() - setting
+    # them after physics has already started stepping did not reliably take
+    # effect (confirmed by testing: worked in an isolated script that set
+    # kinematic pre-play, failed here when it was set post-play).
+    robot_state = None
+    robot_base_prim = stage.GetPrimAtPath(ROBOT_BASE_PATH)
+    if robot_base_prim.IsValid() and robot_base_prim.HasAPI(UsdPhysics.RigidBodyAPI):
+        rigid_api = UsdPhysics.RigidBodyAPI(robot_base_prim)
+        attr = rigid_api.GetKinematicEnabledAttr()
+        if attr:
+            attr.Set(True)
+        else:
+            rigid_api.CreateKinematicEnabledAttr(True)
+
+        start = get_translate(robot_base_prim)
+
+        followers = []
+        for follower_path in ROBOT_FOLLOWER_PATHS:
+            follower_prim = stage.GetPrimAtPath(follower_path)
+            if not follower_prim.IsValid():
+                print(f"  WARNING: follower prim not found at {follower_path}")
+                continue
+            if follower_prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                f_rigid_api = UsdPhysics.RigidBodyAPI(follower_prim)
+                f_attr = f_rigid_api.GetKinematicEnabledAttr()
+                if f_attr:
+                    f_attr.Set(True)
+                else:
+                    f_rigid_api.CreateKinematicEnabledAttr(True)
+            follower_start = get_translate(follower_prim)
+            offset = (follower_start[0] - start[0], follower_start[1] - start[1], follower_start[2] - start[2])
+            followers.append({"prim": follower_prim, "offset": offset})
+
+        robot_state = {
+            "prim": robot_base_prim,
+            "position": (start[0], start[1], 0),
+            "patrol_index": 0,
+            "mode": "patrol",
+            "target": None,
+            "handling_alert": None,
+            "last_check": 0,
+            "handled_timestamps": set(),
+            "followers": followers,
+        }
+        print(f"Robot found at {ROBOT_BASE_PATH}, set kinematic, starting patrol. {len(followers)} follower parts attached.")
+    else:
+        print(f"WARNING: robot base prim not found/valid at {ROBOT_BASE_PATH} - robot dispatch disabled this run.")
+
+    # NOW play the timeline, after all kinematic flags are set - order matters here.
+    timeline = omni.timeline.get_timeline_interface()
+    timeline.play()
+    for _ in range(20):
+        simulation_app.update()
 
     # Live per-zone loitering streak tracker, persists across sweeps for the
     # whole run - see check_loitering() for why this replaced a log-based check.
@@ -567,18 +791,26 @@ def main():
 
     sim_start = time.time()
     last_sweep_time = 0
+    last_tick_elapsed = 0.0
+    authorized_ids_cache = load_authorized_ids()
 
     try:
         while True:
             elapsed = time.time() - sim_start
+            dt = elapsed - last_tick_elapsed
+            last_tick_elapsed = elapsed
 
             for m in movers:
                 update_person_position(m, elapsed)
+
+            if robot_state is not None:
+                update_robot(robot_state, elapsed, dt, authorized_ids_cache)
+
             simulation_app.update()
 
             if elapsed - last_sweep_time >= SCAN_INTERVAL_SECONDS:
-                authorized_ids = load_authorized_ids()
-                run_sweep(camera_zones, authorized_ids, streak_state)
+                authorized_ids_cache = load_authorized_ids()
+                run_sweep(camera_zones, authorized_ids_cache, streak_state)
                 last_sweep_time = elapsed
 
     except KeyboardInterrupt:
