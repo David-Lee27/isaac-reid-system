@@ -1,0 +1,82 @@
+[
+  {
+    "event_type": "zone",
+    "person_id": "unidentified",
+    "zone": "Zone_A_NorthEast",
+    "camera": "/World/Camera1",
+    "timestamp": "2026-08-18T00:14:42.679307+00:00"
+  },
+  {
+    "event_type": "checkpoint",
+    "person_id": "ID_0001",
+    "checkpoint": "EntryCamera",
+    "authorized": true,
+    "timestamp": "2026-08-18T00:15:36.467672+00:00"
+  },
+  {
+    "event_type": "zone",
+    "person_id": "unidentified",
+    "zone": "Zone_A_NorthEast",
+    "camera": "/World/Camera1",
+    "timestamp": "2026-08-18T00:15:52.778800+00:00"
+  },
+  {
+    "event_type": "fall_alert",
+    "zone": "Zone_C_SouthWest",
+    "camera": "/World/Camera3",
+    "timestamp": "2026-08-18T00:16:23.998756+00:00"
+  },
+  {
+    "event_type": "dispatch_alert",
+    "reason": "fall",
+    "person_id": null,
+    "zone": "Zone_C_SouthWest",
+    "coords": [
+      -28.71,
+      -9.28
+    ],
+    "timestamp": "2026-08-18T00:16:23.999756+00:00"
+  },
+  {
+    "event_type": "zone",
+    "person_id": "unidentified",
+    "zone": "Zone_C_SouthWest",
+    "camera": "/World/Camera3",
+    "timestamp": "2026-08-18T00:16:14.832092+00:00"
+  },
+  {
+    "event_type": "robot_response",
+    "found": false,
+    "alert_reason": "fall",
+    "zone": "Zone_C_SouthWest",
+    "timestamp": "2026-08-18T00:16:43.020576+00:00"
+  },
+  {
+    "event_type": "zone",
+    "person_id": "unidentified",
+    "zone": "Zone_D_NorthWest",
+    "camera": "/World/Camera4",
+    "timestamp": "2026-08-18T00:16:43.080634+00:00"
+  },
+  {
+    "event_type": "zone",
+    "person_id": "unidentified",
+    "zone": "Zone_A_NorthEast",
+    "camera": "/World/Camera1",
+    "timestamp": "2026-08-18T00:17:20.245974+00:00"
+  },
+  {
+    "event_type": "zone",
+    "person_id": "unidentified",
+    "zone": "Zone_B_SouthEast",
+    "camera": "/World/Camera2",
+    "timestamp": "2026-08-18T00:17:20.245974+00:00"
+  },
+  {
+    "event_type": "zone",
+    "person_id": "unidentified",
+    "zone": "Zone_B_SouthEast",
+    "camera": "/World/Camera2",
+    "timestamp": "2026-08-18T00:17:48.209133+00:00"
+  }
+]

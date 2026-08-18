@@ -706,6 +706,17 @@ def main():
 
     stage = usd_context.get_stage()
 
+    # The piper arm is set up as a USD payload - unloading it excludes it
+    # from the scene entirely (non-destructive, can be re-enabled later via
+    # .Load()) which stops the ungoverned arm-flailing we saw, since there's
+    # simply no arm geometry/physics present to flail.
+    piper_arm_prim = stage.GetPrimAtPath("/World/mobile_manipulator_ros/piper_arm")
+    if piper_arm_prim.IsValid():
+        piper_arm_prim.Unload()
+        print("Piper arm payload unloaded (disabled).")
+    else:
+        print("WARNING: piper_arm prim not found - nothing to unload.")
+
     movers = []
     for name, info in PEOPLE.items():
         prim = stage.GetPrimAtPath(info["prim_path"])
