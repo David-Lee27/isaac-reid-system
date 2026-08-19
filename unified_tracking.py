@@ -47,6 +47,13 @@ WAYPOINTS = [
 SECONDS_PER_LEG = 4
 LOOP_PATROL = True
 
+# When a fall is detected, the nearest patrol character to that zone gets
+# frozen in place for this long - simple placeholder so the robot has
+# someone to actually find on arrival, rather than the "fallen" person
+# just continuing to walk their patrol loop. Real fallen-pose animation is
+# a separate later task.
+FALL_PAUSE_DURATION = 45  # seconds
+
 # --- Randomized loitering test ---
 # One random person gets assigned a random window during the run where,
 # instead of patrolling, they wander in small circles near a random zone -
@@ -72,7 +79,7 @@ ZONE_CENTERS = {
 # double-check the person's identity/authorization, then resumes patrol.
 ROBOT_PRIM_PATH = "/World/mobile_manipulator_ros"
 ROBOT_BASE_PATH = "/World/mobile_manipulator_ros/base_footprint"  # actual physics-driven prim - moving the outer group prim does nothing, PhysX drives this child directly
-ROBOT_CAMERA_PATH = "/World/mobile_manipulator_ros/camera_front/Gemini335L/Gemini335L/camera_rgb/Camera_rgb"
+ROBOT_CAMERA_PATH = "/World/mobile_manipulator_ros/base_footprint/sensors/camera_front/Gemini335L/Gemini335L/camera_rgb/Camera_rgb"
 ROBOT_SPEED = 3.0             # meters per second
 ROBOT_CHECK_INTERVAL = 3.0    # seconds between checking for new dispatch alerts while patrolling
 
@@ -87,13 +94,15 @@ ROBOT_WAYPOINTS = [
     (-20, 20, 0),
 ]
 
-# base_footprint is the only prim with a real physics-driven root, but
-# camera_front, camera_hand_link, wheel_left, wheel_right are SIBLINGS of
-# base_footprint (not children!) under the top-level robot group - moving
-# base_footprint does NOT bring them along. We move them manually as a
-# rigid group, preserving their original offset from base_footprint.
+# base_footprint is the only prim with a real physics-driven root. wheel_left
+# and wheel_right are SIBLINGS of base_footprint (not children!) under the
+# top-level robot group, so moving base_footprint does NOT bring them along -
+# we move them manually as a rigid group, preserving their original offset.
+# NOTE: the OLD /World/mobile_manipulator_ros/camera_front sibling copy is a
+# disconnected leftover mount - the REAL, properly-attached camera used for
+# ROBOT_CAMERA_PATH lives under base_footprint/sensors/ as a genuine child,
+# so it doesn't need to be in this follower list at all.
 ROBOT_FOLLOWER_PATHS = [
-    "/World/mobile_manipulator_ros/camera_front",
     "/World/mobile_manipulator_ros/camera_hand_link",
     "/World/mobile_manipulator_ros/wheel_left",
     "/World/mobile_manipulator_ros/wheel_right",
@@ -101,6 +110,14 @@ ROBOT_FOLLOWER_PATHS = [
 
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": HEADLESS})
+
+# Raise Isaac Sim's own engine log threshold so routine warnings (camera
+# aperture math, DLSS resolution notes, "annotator returned None" render
+# warmup messages, etc.) stop flooding the console - only real errors show.
+import carb
+carb.settings.get_settings().set("/log/level", "Error")
+carb.settings.get_settings().set("/log/fileLogLevel", "Error")
+carb.settings.get_settings().set("/log/outputStreamLevel", "Error")
 
 import omni.usd
 import omni.timeline
@@ -116,7 +133,6 @@ import random
 import math
 from datetime import datetime, timezone
 from isaacsim.sensors.camera import Camera
-import carb
 
 
 # ---------- Movement helpers ----------
@@ -151,6 +167,11 @@ def disable_physics_recursive(prim):
 
 
 def update_person_position(mover, elapsed):
+    # Frozen in place from a recent fall detection - skip all movement,
+    # patrol and loiter alike, until the pause expires.
+    if elapsed < mover.get("paused_until", 0):
+        return
+
     # If this mover is in their assigned loiter window, wander in small
     # circles near the loiter center instead of following the patrol path.
     loiter_start = mover.get("loiter_start")
@@ -189,6 +210,22 @@ def update_person_position(mover, elapsed):
         p1[2] + (p2[2] - p1[2]) * leg_t,
     )
     set_translate(mover["prim"], new_pos)
+
+
+def pause_nearest_mover(movers, zone_name, elapsed):
+    """Freezes whichever patrol character is currently closest to the given
+    zone's coordinates, for FALL_PAUSE_DURATION seconds - simple stand-in
+    for 'the person who fell stays down' until real fall animation exists."""
+    zone_pos = ZONE_CENTERS.get(zone_name)
+    if zone_pos is None or not movers:
+        return
+
+    nearest = min(movers, key=lambda m: (
+        (get_translate(m["prim"])[0] - zone_pos[0]) ** 2 +
+        (get_translate(m["prim"])[1] - zone_pos[1]) ** 2
+    ))
+    nearest["paused_until"] = elapsed + FALL_PAUSE_DURATION
+    print(f"  [{zone_name}] freezing {nearest['name']} in place for {FALL_PAUSE_DURATION}s (simulating staying down)")
 
 
 def move_toward(current, target, step):
@@ -508,8 +545,9 @@ def scan_zone_camera(camera_path, zone_name):
         return None
 
     best_detection = max(detections, key=lambda d: d["confidence"])
+    fell = check_for_fall(best_detection)
 
-    if check_for_fall(best_detection):
+    if fell:
         print(f"  [{zone_name}] *** FALL DETECTED ***")
         append_log_entry({
             "event_type": "fall_alert",
@@ -528,7 +566,7 @@ def scan_zone_camera(camera_path, zone_name):
 
     crop = crop_person(bgr, best_detection)
     if crop.size == 0:
-        return {"error": "empty crop"}
+        return {"error": "empty crop", "fell": fell}
 
     crop_path = os.path.join(os.environ["TEMP"], f"crop_{tag}.jpg")
     cv2.imwrite(crop_path, crop)
@@ -540,14 +578,14 @@ def scan_zone_camera(camera_path, zone_name):
     if reid_result.get("status") == "match":
         matched_filename = os.path.basename(reid_result["matched_path"])
         person_id = os.path.splitext(matched_filename)[0]
-        return {"person_id": person_id, "distance": reid_result["distance"], "match_type": "face"}
+        return {"person_id": person_id, "distance": reid_result["distance"], "match_type": "face", "fell": fell}
     else:
         # Face detection failed or didn't match - fall back to clothing/color
         # signature, which is far more reliable from wide zone camera angles.
         appearance_id, appearance_score = find_appearance_match(crop)
         if appearance_id:
-            return {"person_id": appearance_id, "score": appearance_score, "match_type": "clothing"}
-        return {"person_id": "unidentified", "reason": reid_result.get("reason", "no match")}
+            return {"person_id": appearance_id, "score": appearance_score, "match_type": "clothing", "fell": fell}
+        return {"person_id": "unidentified", "reason": reid_result.get("reason", "no match"), "fell": fell}
 
 
 def scan_checkpoint(authorized_ids):
@@ -616,7 +654,7 @@ def scan_checkpoint(authorized_ids):
         })
 
 
-def run_sweep(camera_zones, authorized_ids, streak_state):
+def run_sweep(camera_zones, authorized_ids, streak_state, movers, elapsed):
     timestamp = datetime.now(timezone.utc).isoformat()
     print(f"\n--- Sweep at {timestamp} ---")
 
@@ -630,6 +668,9 @@ def run_sweep(camera_zones, authorized_ids, streak_state):
             if result and result.get("error"):
                 print(f"  [{zone_name}] error: {result['error']}")
             continue
+
+        if result.get("fell"):
+            pause_nearest_mover(movers, zone_name, elapsed)
 
         streak_state[zone_name]["streak"] += 1
 
@@ -658,6 +699,8 @@ def run_sweep(camera_zones, authorized_ids, streak_state):
         if check_loitering(zone_name, streak_state):
             coords = ZONE_CENTERS.get(zone_name)
             print(f"  [{zone_name}] *** LOITERING (someone present {LOITER_THRESHOLD}+ sweeps in a row) ***")
+            if person_id not in (None, "unidentified"):
+                pause_nearest_mover(movers, zone_name, elapsed)
             append_log_entry({
                 "event_type": "loitering_alert",
                 "person_id": person_id,
@@ -728,7 +771,8 @@ def main():
         full_path = [(start[0], start[1], start[2])] + WAYPOINTS
         movers.append({
             "name": name, "prim": prim, "path": full_path, "start_delay": info["start_delay"],
-            "loiter_start": None, "loiter_duration": None, "loiter_center": None
+            "loiter_start": None, "loiter_duration": None, "loiter_center": None,
+            "paused_until": 0
         })
 
     # --- Robot setup ---
@@ -821,7 +865,7 @@ def main():
 
             if elapsed - last_sweep_time >= SCAN_INTERVAL_SECONDS:
                 authorized_ids_cache = load_authorized_ids()
-                run_sweep(camera_zones, authorized_ids_cache, streak_state)
+                run_sweep(camera_zones, authorized_ids_cache, streak_state, movers, elapsed)
                 last_sweep_time = elapsed
 
     except KeyboardInterrupt:

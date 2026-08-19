@@ -106,3 +106,83 @@ Responding." This is expected, not a crash - the process is just busy. Confirmed
 Task Manager CPU/disk activity during a "frozen" period. Real cost: can't visually
 inspect the viewport while a sweep is running, since it blocks the whole app,
 including camera switching.
+
+**Robot articulation physics vs. simple rigid bodies (human characters)**
+Human characters are simple independent rigid bodies - `disable_physics_recursive()`
+(setting `rigidBodyEnabled=False` on each) works fine and stops gravity entirely,
+letting them be moved purely by direct transform overrides. The robot is a full
+PhysX **articulation** (base + wheels + arm, all linked by joints) - PhysX explicitly
+refuses `rigidBodyEnabled=False` on articulation members ("not supported if the rigid
+body is part of an articulation"), so that same approach silently failed on every
+link, gravity kept acting on it normally, and it fell through the floor while our
+script's transform overrides fought a losing battle against live physics each frame.
+
+Real fix: target the actual physics-driven prim directly - `base_footprint`, not the
+outer `/World/mobile_manipulator_ros` group Xform (moving the parent group did
+nothing, since PhysX drives the child's world transform independently) - and set
+it **kinematic** (`kinematicEnabled=True`) rather than trying to disable it entirely.
+Kinematic is the officially-supported way to let a script drive a physics body's
+transform while collision still respects it. Critically, the kinematic flag must be
+set **before** `timeline.play()` - setting it after physics has already started
+stepping did not reliably take effect (confirmed by direct A/B test: same code,
+different order, different result).
+
+**Sibling prims that don't move with their parent**
+`camera_front`, `camera_hand_link`, `wheel_left`, `wheel_right` looked like they
+should be attached to `base_footprint`, but the asset actually has them as direct
+**siblings** of `base_footprint` under the top-level robot group, not children of it.
+Moving `base_footprint` alone left them behind. Fixed by manually moving each of
+them in lockstep with the base every frame, preserving their original relative
+offset - not a physics fix, just accounting for the asset's actual prim hierarchy
+rather than assuming a logical grouping that wasn't really there.
+
+**Floor and wheels had no collision at all**
+Discovered only once real physics-driven control (ROS2 `/cmd_vel`, for Nav2) was
+tested for the first time - the human characters' physics was always fully disabled,
+so they never actually exercised real floor collision, and the robot's earlier
+fall-through-floor issue was masked by the kinematic fix, which doesn't need working
+collision to "work" for teleport-style movement. Running the robot with genuine
+physics (no kinematic override, no scripted position) immediately free-fell through
+the warehouse floor. Root cause: the warehouse floor mesh had no Collision API at
+all, and the robot's wheels had `RigidBodyAPI` but no actual collision shapes either
+(only `base_footprint` had real collision). Fixed by adding a Collider Preset to the
+floor mesh (collision-only, not Rigid Body - floors must stay static) and a Collider
+Preset to each wheel (collision-only, since they already had RigidBodyAPI - adding
+another would have duplicated it).
+
+**WSL2 <-> Windows ROS2 bridging (Isaac Sim on Windows, ROS2 in WSL2 Ubuntu)**
+Isaac Sim runs natively on Windows; ROS2 (Jazzy, matching Ubuntu 24.04) runs inside
+WSL2 - two separate network environments that don't share multicast-based DDS
+discovery by default. Tried WSL2's "mirrored" networking mode first (`.wslconfig`
+with `networkingMode=mirrored`) since it's supposed to make this seamless - instead
+it broke the ROS2 daemon's ability to reach even itself over localhost (connection
+timeouts on `ros2 daemon start`/`stop`). Confirmed this was the actual cause via A/B
+test: reverting to default NAT networking immediately fixed the daemon.
+
+Working fix instead: keep NAT mode, and explicitly configure DDS discovery instead of
+relying on automatic multicast crossing the NAT boundary:
+- On both the WSL side and the Windows side, set
+  `ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET` and `ROS_STATIC_PEERS=<other side's IP>`
+  (WSL's IP via `hostname -I`, Windows' IP-as-seen-from-WSL via
+  `ip route show | grep default`, which is the NAT gateway address)
+- Added a Windows Firewall inbound rule allowing UDP 7400-7500 (standard DDS
+  discovery/traffic port range) from WSL's IP specifically
+- Confirmed working end-to-end: enabled Isaac Sim's `isaacsim.ros2.bridge` extension,
+  and `ros2 topic list` from WSL successfully showed live topics from Isaac Sim
+  (`/odom`, `/tf`, `/cmd_vel`, camera and lidar topics), confirmed with
+  `ros2 topic echo /odom --once` returning real (if physically falling, pre-collision-fix)
+  data.
+
+Note WSL's NAT IP can change across reboots - the static peer IPs may need updating
+if discovery stops working after a restart.
+
+**Duplicate camera_front prims - one real, one orphaned**
+Discovered while testing real `/cmd_vel` physics-driven movement (no kinematic
+override) for the first time: the camera visibly floated, disconnected from the
+body. Turned out there are TWO `camera_front` sensor rigs in the asset - a properly
+nested one at `base_footprint/sensors/camera_front/...` (a genuine USD child of
+`base_footprint`, moves automatically, no hack needed) and a disconnected leftover
+copy directly under `/World/mobile_manipulator_ros/camera_front` (a loose sibling,
+which is what we'd been using and needed the manual follower-offset hack for this
+whole time). Switched `ROBOT_CAMERA_PATH` to the real nested one and removed it from
+the follower list - no more manual positioning needed for the camera specifically.
