@@ -350,3 +350,56 @@ copy directly under `/World/mobile_manipulator_ros/camera_front` (a loose siblin
 which is what we'd been using and needed the manual follower-offset hack for this
 whole time). Switched `ROBOT_CAMERA_PATH` to the real nested one and removed it from
 the follower list - no more manual positioning needed for the camera specifically.
+
+## CONFIRMED WORKING: Nav2 velocity_smoother bypass
+
+The `topic_tools relay /cmd_vel_nav /cmd_vel` workaround is confirmed fixed and
+working end-to-end. Root cause of the goal rejection on the first retest attempt
+was separate and simpler: the `static_transform_publisher` (map->odom) terminal
+got killed (Ctrl+C) before Nav2 launched, so the `map` frame didn't exist and the
+costmap/goal validation failed immediately ("Timed out waiting for transform from
+base_link to map... frame does not exist", "Goal was rejected"). Re-ran with the
+static transform publisher kept alive in its own terminal for the whole session,
+verified with `ros2 run tf2_ros tf2_echo map odom` before launching Nav2 - after
+that, the goal was accepted and `tf2_echo odom base_footprint` showed real,
+steadily increasing translation (e.g. X: 1.859 -> 2.046 -> 2.234 -> 2.429 -> 2.616
+across successive timestamps), confirming the robot is genuinely driving under real
+Nav2 planner/controller output, not teleporting.
+
+**Nav2 integration is now fully functional end-to-end**: goal sent -> planned ->
+controller computes `/cmd_vel_nav` -> relay forwards to `/cmd_vel` -> Isaac Sim robot
+physically drives toward the goal. This closes out the ROS2 Nav2 integration work.
+
+## Current status / how to resume (UPDATED)
+
+**What's fully working:** core detection/re-ID/zones/checkpoint/authorization/fall/
+loitering/appearance-fallback pipeline (`unified_tracking.py`). Robot moves correctly
+via kinematic teleport for the dispatch-alert system. WSL2<->Windows ROS2 bridge
+fully working, including headless. **Nav2 navigation is now fully working**,
+including real physics-driven movement via the velocity_smoother relay bypass -
+verified with actual odometry translation change under a live goal.
+
+**Next steps (not yet started):**
+1. Decide whether to wire real Nav2 goal-sending into the existing dispatch-alert
+   system (currently uses kinematic teleport) - replacing teleport with a real
+   `NavigateToPose` action call when the robot is dispatched to fall/loitering/
+   unauthorized-presence coordinates would make the robot's response fully physics-
+   and-navigation-driven end-to-end, which is a stronger portfolio story than teleport.
+2. Benchmark re-ID metrics (accuracy/latency) for portfolio documentation.
+3. Record demo video.
+4. Polish GitHub repo + README with clear documentation of engineering decisions,
+   using this file as the source log.
+
+**Every-session Nav2 setup checklist (order matters, confirmed working):**
+1. Windows PowerShell: `. C:\isaacsim\projects\surveillance-proj\set_ros_env.ps1`
+2. `C:\isaacsim\python.bat C:\isaacsim\projects\surveillance-proj\headless_slam_session.py`
+   - wait for "Headless SLAM session running"
+3. WSL (own terminal, KEEP RUNNING, do not Ctrl+C):
+   `ros2 run tf2_ros static_transform_publisher -13.84 5.06 0 0 0 0 map odom`
+4. Verify: `ros2 run tf2_ros tf2_echo map odom` shows repeated output before proceeding
+5. WSL: `ros2 launch nav2_bringup bringup_launch.py map:=/home/popli/warehouse_map.yaml`
+   - wait for full activation, no more "Timed out waiting for transform" spam
+6. WSL: `ros2 run topic_tools relay /cmd_vel_nav /cmd_vel` (own terminal, keep running)
+7. Send goal: `ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose "{pose: {header: {frame_id: 'map'}, pose: {position: {x: 0.0, y: 10.0, z: 0.0}, orientation: {w: 1.0}}}}"`
+8. Verify: `ros2 run tf2_ros tf2_echo odom base_footprint` - translation should
+   steadily change over time.
