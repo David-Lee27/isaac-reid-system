@@ -80,8 +80,20 @@ ZONE_CENTERS = {
 ROBOT_PRIM_PATH = "/World/mobile_manipulator_ros"
 ROBOT_BASE_PATH = "/World/mobile_manipulator_ros/base_footprint"  # actual physics-driven prim - moving the outer group prim does nothing, PhysX drives this child directly
 ROBOT_CAMERA_PATH = "/World/mobile_manipulator_ros/base_footprint/sensors/camera_front/Gemini335L/Gemini335L/camera_rgb/Camera_rgb"
-ROBOT_SPEED = 3.0             # meters per second
-ROBOT_CHECK_INTERVAL = 3.0    # seconds between checking for new dispatch alerts while patrolling
+ROBOT_CHECK_INTERVAL = 3.0    # seconds between checking for new dispatch alerts / arrival
+
+# --- Real Nav2 navigation (replaces the old kinematic-teleport robot movement) ---
+# The robot now moves via genuine PhysX physics, driven externally by Nav2's
+# controller through the confirmed-working velocity_smoother relay bypass
+# (see NOTES.md). This script no longer commands robot movement directly -
+# a separate WSL-side script (dispatch_bridge.py) watches EVENT_LOG_FILE for
+# dispatch_alert entries and PATROL_WAYPOINTS_FILE for the patrol loop, and
+# sends real NavigateToPose goals to Nav2. This script's only job re: the
+# robot is to (a) write the patrol waypoints out for the bridge to read, and
+# (b) watch the robot's REAL position (driven by physics, not by us) to
+# detect arrival at a dispatch location and trigger the on-arrival scan.
+PATROL_WAYPOINTS_FILE = PROJECT_DIR + r"\robot_patrol_waypoints.json"
+ARRIVAL_RADIUS = 2.0          # meters - how close counts as "arrived" for triggering a scan
 
 # Robot gets its own patrol loop, pulled in from the walls compared to the
 # people's path - it's a bigger vehicle and (being kinematic) doesn't get
@@ -94,22 +106,41 @@ ROBOT_WAYPOINTS = [
     (-20, 20, 0),
 ]
 
-# base_footprint is the only prim with a real physics-driven root. wheel_left
-# and wheel_right are SIBLINGS of base_footprint (not children!) under the
-# top-level robot group, so moving base_footprint does NOT bring them along -
-# we move them manually as a rigid group, preserving their original offset.
-# NOTE: the OLD /World/mobile_manipulator_ros/camera_front sibling copy is a
-# disconnected leftover mount - the REAL, properly-attached camera used for
-# ROBOT_CAMERA_PATH lives under base_footprint/sensors/ as a genuine child,
-# so it doesn't need to be in this follower list at all.
-ROBOT_FOLLOWER_PATHS = [
-    "/World/mobile_manipulator_ros/camera_hand_link",
-    "/World/mobile_manipulator_ros/wheel_left",
-    "/World/mobile_manipulator_ros/wheel_right",
-]
+# NOTE (known limitation, documented rather than solved - see NOTES.md):
+# wheel_left/wheel_right/camera_hand_link are SIBLINGS of base_footprint
+# (not children), not connected to it by a physics joint. In the old
+# kinematic-teleport design we moved them manually every frame to fake
+# attachment. In real-physics Nav2 mode, base_footprint now moves under
+# genuine PhysX + the robot's own ROS2 diff-drive plugin (confirmed working
+# in the Nav2 relay test), but these sibling parts have no joint tying them
+# to it, so they may visually lag/stay behind during navigation. Cosmetic
+# only - it doesn't affect navigation, detection, or the checkpoint-style
+# scan, since ROBOT_CAMERA_PATH is the properly-nested camera under
+# base_footprint/sensors/ and moves correctly with it automatically.
+
+# Isaac Sim's ROS2 bridge extension needs its OWN internal environment
+# variables set (pointing at its bundled ROS2 libraries) before it starts -
+# unrelated to the WSL/Jazzy discovery env vars set by set_ros_env.ps1. Must
+# be set BEFORE `from isaacsim import SimulationApp` - confirmed in
+# headless_slam_session.py.
+import os
+os.environ["ROS_DISTRO"] = "humble"
+os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
+os.environ["PATH"] = os.environ["PATH"] + ";c:/isaacsim/exts/isaacsim.ros2.core/humble/lib"
 
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": HEADLESS})
+
+# Explicitly enable the ROS2 bridge extension - toggling it on manually in
+# the GUI only applies to that running session and does NOT carry over to a
+# fresh script launch. Without this, /odom, /cmd_vel, /tf etc. are absent
+# and Nav2 has nothing to navigate with.
+import omni.kit.app
+ext_manager = omni.kit.app.get_app().get_extension_manager()
+ext_manager.set_extension_enabled_immediate("isaacsim.ros2.bridge", True)
+print("ROS2 bridge extension explicitly enabled.")
+for _ in range(20):
+    simulation_app.update()
 
 # Raise Isaac Sim's own engine log threshold so routine warnings (camera
 # aperture math, DLSS resolution notes, "annotator returned None" render
@@ -126,7 +157,6 @@ import cv2
 import numpy as np
 import subprocess
 import json
-import os
 import shutil
 import time
 import random
@@ -228,20 +258,6 @@ def pause_nearest_mover(movers, zone_name, elapsed):
     print(f"  [{zone_name}] freezing {nearest['name']} in place for {FALL_PAUSE_DURATION}s (simulating staying down)")
 
 
-def move_toward(current, target, step):
-    """Moves `current` (x,y) toward `target` (x,y) by up to `step` distance.
-    Returns (new_position, arrived_bool). Used for the robot's dispatch and
-    patrol movement, which - unlike the people's fixed-time-per-leg
-    interpolation - moves at a constant real-world speed."""
-    dx = target[0] - current[0]
-    dy = target[1] - current[1]
-    dist = math.hypot(dx, dy)
-    if dist <= step or dist < 0.05:
-        return (target[0], target[1], 0), True
-    ratio = step / dist
-    return (current[0] + dx * ratio, current[1] + dy * ratio, 0), False
-
-
 def find_next_unhandled_alert(handled_timestamps):
     """Reads the event log for the oldest dispatch_alert that has real
     coordinates and hasn't already been handled by the robot this run."""
@@ -321,49 +337,29 @@ def scan_robot(camera_path, authorized_ids, alert):
         })
 
 
-def move_followers(robot_state, base_new_pos):
-    """Moves camera_front/wheel_left/wheel_right/camera_hand_link to keep
-    their original offset from base_footprint's new position - they don't
-    move on their own since they're siblings, not children, of base_footprint."""
-    for follower in robot_state["followers"]:
-        offset = follower["offset"]
-        new_pos = (base_new_pos[0] + offset[0], base_new_pos[1] + offset[1], base_new_pos[2] + offset[2])
-        set_translate(follower["prim"], new_pos)
+def update_robot(robot_state, elapsed, authorized_ids):
+    """The robot is no longer moved by this script at all - it's driven by
+    real PhysX physics under Nav2's control, via the WSL-side
+    dispatch_bridge.py sending real NavigateToPose goals (patrol waypoints
+    when idle, dispatch_alert coords when one exists - see PATROL_WAYPOINTS_FILE
+    and EVENT_LOG_FILE). This function's only job is to watch the robot's
+    REAL position and, once it's physically close enough to an unhandled
+    dispatch alert's coordinates, trigger the on-arrival checkpoint-style scan.
+    """
+    if elapsed - robot_state["last_check"] < ROBOT_CHECK_INTERVAL:
+        return
+    robot_state["last_check"] = elapsed
 
+    alert = find_next_unhandled_alert(robot_state["handled_timestamps"])
+    if alert is None:
+        return
 
-def update_robot(robot_state, elapsed, dt, authorized_ids):
-    if robot_state["mode"] == "patrol" and elapsed - robot_state["last_check"] >= ROBOT_CHECK_INTERVAL:
-        robot_state["last_check"] = elapsed
-        alert = find_next_unhandled_alert(robot_state["handled_timestamps"])
-        if alert:
-            robot_state["mode"] = "dispatched"
-            robot_state["target"] = alert["coords"]
-            robot_state["handling_alert"] = alert
-            print(f"\n*** ROBOT DISPATCHED: {alert['reason']} in {alert['zone']} at {alert['coords']} ***")
-
-    current = robot_state["position"]
-    distance_step = ROBOT_SPEED * dt
-
-    if robot_state["mode"] == "dispatched":
-        new_pos, arrived = move_toward(current, robot_state["target"], distance_step)
-        robot_state["position"] = new_pos
-        set_translate(robot_state["prim"], new_pos)
-        move_followers(robot_state, new_pos)
-        if arrived:
-            alert = robot_state["handling_alert"]
-            scan_robot(ROBOT_CAMERA_PATH, authorized_ids, alert)
-            robot_state["handled_timestamps"].add(alert["timestamp"])
-            robot_state["mode"] = "patrol"
-            robot_state["target"] = None
-            robot_state["handling_alert"] = None
-    else:
-        target = ROBOT_WAYPOINTS[robot_state["patrol_index"]]
-        new_pos, arrived = move_toward(current, target, distance_step)
-        robot_state["position"] = new_pos
-        set_translate(robot_state["prim"], new_pos)
-        move_followers(robot_state, new_pos)
-        if arrived:
-            robot_state["patrol_index"] = (robot_state["patrol_index"] + 1) % len(ROBOT_WAYPOINTS)
+    current = get_translate(robot_state["prim"])
+    target = alert["coords"]
+    dist = math.hypot(current[0] - target[0], current[1] - target[1])
+    if dist <= ARRIVAL_RADIUS:
+        scan_robot(ROBOT_CAMERA_PATH, authorized_ids, alert)
+        robot_state["handled_timestamps"].add(alert["timestamp"])
 
 
 # ---------- Tracking helpers ----------
@@ -776,51 +772,34 @@ def main():
         })
 
     # --- Robot setup ---
-    # IMPORTANT: kinematic flags must be set BEFORE timeline.play() - setting
-    # them after physics has already started stepping did not reliably take
-    # effect (confirmed by testing: worked in an isolated script that set
-    # kinematic pre-play, failed here when it was set post-play).
+    # The robot runs in REAL PHYSICS mode for the whole session (kinematic
+    # OFF), driven by Nav2 through the confirmed-working velocity_smoother
+    # relay bypass - see NOTES.md. Per prior debugging, the kinematic flag
+    # must be set BEFORE timeline.play() to reliably take effect, so this
+    # happens once here and is never toggled at runtime.
     robot_state = None
     robot_base_prim = stage.GetPrimAtPath(ROBOT_BASE_PATH)
     if robot_base_prim.IsValid() and robot_base_prim.HasAPI(UsdPhysics.RigidBodyAPI):
         rigid_api = UsdPhysics.RigidBodyAPI(robot_base_prim)
         attr = rigid_api.GetKinematicEnabledAttr()
         if attr:
-            attr.Set(True)
+            attr.Set(False)
         else:
-            rigid_api.CreateKinematicEnabledAttr(True)
+            rigid_api.CreateKinematicEnabledAttr(False)
 
-        start = get_translate(robot_base_prim)
-
-        followers = []
-        for follower_path in ROBOT_FOLLOWER_PATHS:
-            follower_prim = stage.GetPrimAtPath(follower_path)
-            if not follower_prim.IsValid():
-                print(f"  WARNING: follower prim not found at {follower_path}")
-                continue
-            if follower_prim.HasAPI(UsdPhysics.RigidBodyAPI):
-                f_rigid_api = UsdPhysics.RigidBodyAPI(follower_prim)
-                f_attr = f_rigid_api.GetKinematicEnabledAttr()
-                if f_attr:
-                    f_attr.Set(True)
-                else:
-                    f_rigid_api.CreateKinematicEnabledAttr(True)
-            follower_start = get_translate(follower_prim)
-            offset = (follower_start[0] - start[0], follower_start[1] - start[1], follower_start[2] - start[2])
-            followers.append({"prim": follower_prim, "offset": offset})
+        # Write the patrol waypoints out for the WSL-side dispatch_bridge.py
+        # to read, so there's a single source of truth for the patrol route
+        # instead of hardcoding it twice.
+        with open(PATROL_WAYPOINTS_FILE, "w") as f:
+            json.dump({"waypoints": [[x, y] for x, y, _ in ROBOT_WAYPOINTS]}, f, indent=2)
 
         robot_state = {
             "prim": robot_base_prim,
-            "position": (start[0], start[1], 0),
-            "patrol_index": 0,
-            "mode": "patrol",
-            "target": None,
-            "handling_alert": None,
             "last_check": 0,
             "handled_timestamps": set(),
-            "followers": followers,
         }
-        print(f"Robot found at {ROBOT_BASE_PATH}, set kinematic, starting patrol. {len(followers)} follower parts attached.")
+        print(f"Robot found at {ROBOT_BASE_PATH}, set to real physics mode (kinematic off). "
+              f"Patrol waypoints written to {PATROL_WAYPOINTS_FILE} for dispatch_bridge.py.")
     else:
         print(f"WARNING: robot base prim not found/valid at {ROBOT_BASE_PATH} - robot dispatch disabled this run.")
 
@@ -859,7 +838,7 @@ def main():
                 update_person_position(m, elapsed)
 
             if robot_state is not None:
-                update_robot(robot_state, elapsed, dt, authorized_ids_cache)
+                update_robot(robot_state, elapsed, authorized_ids_cache)
 
             simulation_app.update()
 

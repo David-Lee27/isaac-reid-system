@@ -403,3 +403,62 @@ verified with actual odometry translation change under a live goal.
 7. Send goal: `ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose "{pose: {header: {frame_id: 'map'}, pose: {position: {x: 0.0, y: 10.0, z: 0.0}, orientation: {w: 1.0}}}}"`
 8. Verify: `ros2 run tf2_ros tf2_echo odom base_footprint` - translation should
    steadily change over time.
+
+## IMPLEMENTED: Real Nav2 navigation wired into dispatch-alert system
+
+Replaced the old kinematic-teleport robot movement in `unified_tracking.py`
+with genuine physics-driven Nav2 navigation, for both patrol AND dispatch
+(not just dispatch) - this was a bigger change than originally planned, but
+necessary: the earlier finding that kinematic flags must be set BEFORE
+`timeline.play()` to reliably take effect meant toggling kinematic on/off
+at runtime per-dispatch (patrol=kinematic, dispatched=physics) was too
+risky. So the robot now runs in real physics mode (kinematic OFF) for the
+entire session, and ALL movement - patrol and dispatch alike - goes through
+real Nav2 goals.
+
+**New architecture:**
+- `unified_tracking.py` (Windows/Isaac Sim side): sets the robot base to
+  kinematic OFF once before `timeline.play()`, writes the patrol route to
+  `robot_patrol_waypoints.json`, and no longer commands robot movement at
+  all. `update_robot()` now just watches the robot's REAL position (driven
+  by physics) and triggers the on-arrival checkpoint-style scan
+  (`scan_robot()`) once it's within `ARRIVAL_RADIUS` (2.0m) of an unhandled
+  dispatch_alert's coordinates.
+- `dispatch_bridge.py` (NEW, WSL side): the actual navigation driver. Reads
+  `robot_patrol_waypoints.json` and `event_log.json` directly off the
+  Windows filesystem via `/mnt/c/...`. Default behavior cycles through
+  patrol waypoints via `ros2 action send_goal` (blocking, synchronous CLI
+  call - no rclpy dependency needed since the CLI approach is already
+  confirmed working). Any unhandled `dispatch_alert` in the event log
+  interrupts patrol and sends a goal to that alert's coordinates instead.
+
+**Known limitation (documented, not solved):** `wheel_left`, `wheel_right`,
+and `camera_hand_link` are sibling prims of `base_footprint`, not joined to
+it by a physics joint. The old kinematic design faked attachment by
+manually repositioning them every frame. In real-physics mode they may
+visually lag behind during navigation - cosmetic only, does not affect
+navigation or detection, since `ROBOT_CAMERA_PATH` is a genuine nested
+child of `base_footprint` and moves correctly on its own.
+
+**Not yet tested end-to-end** - this is freshly implemented, next step is
+to actually run it (see updated checklist below) and confirm patrol +
+dispatch + arrival-triggered scan all work together for real.
+
+## Updated every-session checklist (supersedes the one above)
+
+1. Windows PowerShell: `. C:\isaacsim\projects\surveillance-proj\set_ros_env.ps1`
+2. WSL (own terminal, KEEP RUNNING, do not Ctrl+C):
+   `ros2 run tf2_ros static_transform_publisher -13.84 5.06 0 0 0 0 map odom`
+3. Verify: `ros2 run tf2_ros tf2_echo map odom` shows repeated output before proceeding
+4. WSL: `ros2 launch nav2_bringup bringup_launch.py map:=/home/popli/warehouse_map.yaml`
+   - wait for full activation, no more "Timed out waiting for transform" spam
+5. WSL: `ros2 run topic_tools relay /cmd_vel_nav /cmd_vel` (own terminal, keep running)
+6. Windows PowerShell: `C:\isaacsim\python.bat C:\isaacsim\projects\surveillance-proj\unified_tracking.py`
+   - wait for "Robot found... set to real physics mode... Patrol waypoints written..."
+7. WSL (own terminal, keep running): `python3 /mnt/c/isaacsim/projects/surveillance-proj/dispatch_bridge.py`
+   - this is what actually drives the robot now - patrol starts automatically,
+     dispatch alerts will interrupt it when fall/loitering/unauthorized-presence
+     is detected
+8. Watch for `[dispatch_bridge] sending goal (ALERT: ...)` in the
+   `dispatch_bridge.py` terminal and the on-arrival scan output
+   (`[ROBOT] arrived at...`) in the `unified_tracking.py` terminal.
