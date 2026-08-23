@@ -150,6 +150,170 @@ floor mesh (collision-only, not Rigid Body - floors must stay static) and a Coll
 Preset to each wheel (collision-only, since they already had RigidBodyAPI - adding
 another would have duplicated it).
 
+**Headless launch has a different extension/env setup than the GUI**
+Two separate bugs discovered when moving from the interactive GUI to a standalone
+headless script (`headless_slam_session.py`) for better performance:
+1. Manually toggling `isaacsim.ros2.bridge` on in the GUI's Extensions window only
+   applies to that running session - it does NOT carry over to a fresh headless
+   script launch, which boots its own process with default extension state.
+   `/odom` and `/cmd_vel` were completely absent from `ros2 topic list` as a result.
+   Fixed by explicitly enabling it in code before opening the stage:
+   `omni.kit.app.get_app().get_extension_manager().set_extension_enabled_immediate("isaacsim.ros2.bridge", True)`.
+2. Even after that, the bridge printed `"ROS2 Bridge startup failed"` and shut
+   itself back down immediately. Cause: the bridge needs its OWN internal env vars
+   set (pointing at its bundled ROS2 "humble" libraries - unrelated to/different
+   from our external WSL Jazzy install) - `ROS_DISTRO`, `RMW_IMPLEMENTATION`, and a
+   `PATH` addition. Launching via `isaac-sim.bat` (the GUI) sets these automatically;
+   launching via `python.bat` directly does not. Fixed by setting them in Python
+   BEFORE `from isaacsim import SimulationApp`:
+   ```python
+   os.environ["ROS_DISTRO"] = "humble"
+   os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
+   os.environ["PATH"] += ";c:/isaacsim/exts/isaacsim.ros2.core/humble/lib"
+   ```
+   Both fixes together got the full topic set (`/odom`, `/cmd_vel`, both lidars,
+   cameras) publishing correctly in headless mode.
+
+**Headless rendering vs GUI FPS**
+GUI viewport rendering with 5+ cameras + 2 lidars + physics was the real FPS
+bottleneck (down to 0-18 FPS even after switching to RTX-Minimal renderer mode +
+lowering settings). True headless (`{"headless": True}`) skips rendering entirely -
+lidar rate improved from ~5Hz to ~8.5-9Hz. Still not perfectly smooth (some jitter),
+but workable. Note headless mode required the two extension/env fixes above to work
+at all - without them it LOOKED like it was running (topics existed) but had zero
+real data flowing.
+
+**`slam_toolbox` default `scan_topic` mismatch**
+Default config listens on `/scan`, but this robot's lidar publishes to
+`/lidar_front/scan` - completely different topic names, so slam_toolbox was
+silently receiving zero scan messages the entire time (confirmed via
+`ros2 param get /slam_toolbox scan_topic` returning `/scan`, and `/map`/`map->odom`
+tf never appearing despite real odom and lidar data both flowing). Fixed by copying
+the default `mapper_params_online_async.yaml`, editing `scan_topic` to
+`/lidar_front/scan`, and launching with `slam_params_file:=<edited copy>`.
+
+**`/cmd_vel` has no command timeout - Ctrl+C does NOT stop the robot**
+Assumed that killing the `ros2 topic pub` process would stop the robot (like
+releasing a key). It does not - the diff-drive controller keeps executing the
+LAST received Twist message indefinitely, with no automatic zero-velocity
+timeout. Confirmed by checking odometry minutes after "stopping": position was
+still climbing at exactly the last commanded velocity. This most likely
+contributed to an earlier SLAM divergence disaster (translation of -16,927m,
+physically impossible for the actual test duration) - the robot was probably
+still driving, uncontrolled, well past when we thought each test had ended.
+Real fix: always send an explicit zero-velocity message after driving
+(`--once` flag with all-zero linear/angular values), and verify it actually
+stopped by checking odometry twice a few seconds apart before trusting it's stationary.
+
+**SLAM map/odom transform meaning - what's actually the "did it diverge" signal**
+`map -> odom` tf is SLAM's own internal correction/localization offset, NOT the
+robot's position - a small, stable value (e.g. -0.01, -0.1, -0.2) is the HEALTHY
+result, meaning SLAM's belief is staying consistent. The robot's actual position is
+`odom -> base_footprint`. Checked the wrong one early on and mistook a healthy small
+correction offset for "is this still diverged," causing confusion.
+
+**Broken TF frames prevented clean SLAM mapping (root cause never fully solved)**
+Even after fixing the scan_topic mismatch and the stop-command bug, a real driving
+test produced a garbage "starburst" map (scattered radiating lidar points instead of
+clean walls) despite the robot's own odometry staying sane throughout. Isaac Sim's
+console was simultaneously spamming `[PoseTree] parent/target getObjectType eInvalid`
+for `base_link`, `lidar_merged`, and camera sensor frames - meaning the TF publisher
+couldn't resolve several of the robot's own sensor frame prims, so individual lidar
+scans were being placed at wrong orientations relative to the robot even though the
+overall robot position was fine. Never root-caused (would require more prim-hierarchy
+debugging in the robot asset, similar to the camera_front duplicate issue). Given
+time constraints, worked around entirely rather than fixed - see next entry.
+
+**Hand-built map instead of fixing SLAM's broken sensor TF**
+Since Nav2 only needs a valid map.yaml/.pgm pair describing the room and doesn't
+care how it was produced, wrote a small standalone Python script
+(`build_map.py`, WSL, stdlib only) that directly draws a clean occupancy grid: solid
+walls at the room's known real-world bounds (from earlier camera-position/waypoint
+data) plus two blocked squares for the T-obstacle. Verified visually by converting
+.pgm -> .png (`pnmtopng`) and opening via `explorer.exe \\wsl$\...` from Windows,
+since RViz2 would not open in this environment (WSLg GUI issue, not investigated -
+not needed once we stopped relying on it for verification). This fully replaced the
+need to fix the SLAM/TF issue above.
+
+**Nav2 without AMCL - static map->odom transform instead**
+Since AMCL (Nav2's normal live localization) would hit the exact same broken-TF
+sensor issue as SLAM, skipped it in favor of a permanently fixed transform:
+`ros2 run tf2_ros static_transform_publisher <x> <y> 0 0 0 0 map odom`, using the
+robot's known real starting position. This tells Nav2 exactly where odom's origin
+sits within the hand-built map, with no drift-correction, which is fine since we
+confirmed raw odometry itself is accurate and reliable (the earlier 33m straight-line
+drive test tracked correctly).
+
+**Nav2 launch argument syntax**
+`ros2 launch nav2_bringup bringup_launch.py ... slam:=false` threw
+`name 'false' is not defined` regardless of quoting attempts. Root cause never fully
+isolated, but avoided entirely by checking `--show-args` first - the defaults
+(`slam: False`, `use_sim_time: false`) already matched what we wanted, so the
+argument didn't need to be passed at all. Just running
+`ros2 launch nav2_bringup bringup_launch.py map:=<path>` launched cleanly with every
+node (map_server, controller_server, planner_server, costmaps, bt_navigator,
+waypoint_follower, behavior_server, collision_monitor, docking_server) configuring
+and activating successfully - a genuinely clean full Nav2 bringup.
+
+**Nav2 goals accepted and planned, but robot doesn't move - isolated to `velocity_smoother`**
+Sent a real `NavigateToPose` goal via `ros2 action send_goal`; Nav2 accepted it and
+reported a correct `distance_remaining`, but the robot's actual odometry position
+never changed. Diagnosed layer by layer:
+- `/cmd_vel_nav` (controller_server's raw output): publishing at ~20-25Hz, confirmed
+  real - so planning + control computation is genuinely working.
+- `/odom`: healthy 30Hz, confirmed not the blocker.
+- `/cmd_vel` (post-smoother, what Isaac Sim's robot actually subscribes to):
+  ZERO messages, checked for a full minute.
+- Checked `velocity_smoother`'s config directly (`ros2 param get ...`) for common
+  causes - `enable_stamped_cmd_vel` was False (ruled out a Twist-vs-TwistStamped
+  type mismatch theory), other params looked normal. Root cause not found before
+  running out of session time - suspected connection to the same DDS message-timing
+  irregularities seen in Isaac Sim's "sequence size exceeds remaining buffer" console
+  spam (a `/cmd_vel_nav` rate check showed an abnormal negative time delta,
+  `min: -2.430s`, suggesting message reordering/corruption crossing the WSL/Windows
+  bridge for this topic specifically).
+
+Planned workaround for next session (not yet tested): bypass the smoother entirely
+using `ros2 run topic_tools relay /cmd_vel_nav /cmd_vel` - forwards controller
+output directly to the topic Isaac Sim listens to. This is a legitimate, common
+Nav2 deployment pattern (skipping the smoother is supported), not just a hack.
+
+## Current status / how to resume
+
+**What's fully working:** core detection/re-ID/zones/checkpoint/authorization/fall/
+loitering/appearance-fallback pipeline (`unified_tracking.py`) - proven stable across
+many runs. Robot moves correctly via kinematic teleport for the existing
+dispatch-alert system (fall/loitering/unauthorized-presence -> robot drives to
+coords -> arrival scan). WSL2<->Windows ROS2 bridge fully working, including
+headless. Nav2 fully launches and accepts/plans real navigation goals against a
+hand-built map. Real `/cmd_vel_nav` velocity commands are being generated correctly
+by Nav2's controller.
+
+**What's NOT yet confirmed:** whether the robot actually drives in response to a
+real Nav2 goal - blocked on `velocity_smoother` not passing `/cmd_vel_nav` through
+to `/cmd_vel`. Next step is the `topic_tools relay` bypass above.
+
+**Every-session setup checklist (order matters):**
+1. Windows PowerShell: `. C:\isaacsim\projects\surveillance-proj\set_ros_env.ps1`
+   (auto-detects WSL's current IP - was previously manual/hardcoded, now automated)
+2. `C:\isaacsim\python.bat C:\isaacsim\projects\surveillance-proj\headless_slam_session.py`
+   - wait for "Headless SLAM session running"
+3. WSL: `ros2 run tf2_ros static_transform_publisher -13.84 5.06 0 0 0 0 map odom`
+   (leave running in its own terminal)
+4. WSL: `ros2 launch nav2_bringup bringup_launch.py map:=/home/popli/warehouse_map.yaml`
+5. (next step, untested) WSL: `ros2 run topic_tools relay /cmd_vel_nav /cmd_vel`
+6. Send a goal: `ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose "{pose: {header: {frame_id: 'map'}, pose: {position: {x: 0.0, y: 10.0, z: 0.0}, orientation: {w: 1.0}}}}"`
+7. Verify with `ros2 run tf2_ros tf2_echo odom base_footprint` - position should
+   actually change this time if the relay fixes it.
+
+**Key files added this phase:** `set_ros_env.ps1` (auto WSL-IP env setup),
+`headless_slam_session.py` (headless Isaac Sim + ROS2 bridge), `robot_test.py` /
+`robot_camera_test.py` / `robot_combined_test.py` / `robot_kinematic_test.py`
+(isolated robot movement/camera debugging, non-freezing since no camera scan
+subprocess calls), `find_physics_scenes.py` (stage diagnostic), `build_map.py`
+(hand-built occupancy grid, WSL-side), `~/mapper_params.yaml` (WSL, slam_toolbox
+config with corrected scan_topic - not in the Windows project folder).
+
 **WSL2 <-> Windows ROS2 bridging (Isaac Sim on Windows, ROS2 in WSL2 Ubuntu)**
 Isaac Sim runs natively on Windows; ROS2 (Jazzy, matching Ubuntu 24.04) runs inside
 WSL2 - two separate network environments that don't share multicast-based DDS
