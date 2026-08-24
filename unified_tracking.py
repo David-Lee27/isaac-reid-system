@@ -395,9 +395,22 @@ def append_log_entry(entry):
         json.dump(log, f, indent=2)
 
 
+_camera_cache = {}
+
+
 def capture_frame(camera_path, resolution=(640, 480)):
-    camera = Camera(prim_path=camera_path, resolution=resolution)
-    camera.initialize()
+    # Reuse one Camera object per path instead of creating a new one (and a
+    # new render product/annotator) on every single scan call - doing that
+    # every 8s for 5 cameras leaked render products, overran internal render
+    # buffers ("sequence size exceeds remaining buffer" spam), and stalled
+    # the physics step rate badly enough to starve the ROS2 odom publisher.
+    camera = _camera_cache.get(camera_path)
+    if camera is None:
+        camera = Camera(prim_path=camera_path, resolution=resolution)
+        camera.initialize()
+        _camera_cache[camera_path] = camera
+        for _ in range(10):
+            simulation_app.update()
 
     rgba = None
     for i in range(150):

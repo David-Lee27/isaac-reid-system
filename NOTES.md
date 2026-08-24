@@ -462,3 +462,28 @@ dispatch + arrival-triggered scan all work together for real.
 8. Watch for `[dispatch_bridge] sending goal (ALERT: ...)` in the
    `dispatch_bridge.py` terminal and the on-arrival scan output
    (`[ROBOT] arrived at...`) in the `unified_tracking.py` terminal.
+
+## FIXED: "sequence size exceeds remaining buffer" / stalling sim / bad odom rate
+
+First real test of the new Nav2-driven navigation surfaced a serious bug:
+Nav2 goals all timed out after 60s, and `ros2 topic hz /odom` showed a
+wildly inconsistent rate (avg ~0.7Hz, gaps up to 3.9s between messages) -
+far too choppy for Nav2's costmap/planner to work with. Isaac Sim's console
+was also spammed with "sequence size exceeds remaining buffer".
+
+Root cause: `capture_frame()` created a brand NEW `Camera` object (and a
+new underlying render product/annotator) from scratch on every single scan
+call - and with 4 zone cameras + the checkpoint camera scanned every 8
+seconds for the whole run, that's a fresh render product created (and
+never cleaned up) roughly every 1.6s on average. Stale render
+products/annotators piled up, overran an internal render buffer (hence the
+error spam), and stalled the physics step rate badly enough to starve the
+ROS2 bridge's odom publisher - which explains both symptoms at once.
+
+**Fix:** cache one `Camera` object per camera path (`_camera_cache` dict in
+`unified_tracking.py`) instead of recreating it every scan. Each camera is
+now only ever initialized once, on its first use.
+
+**Not yet re-tested** - next step is rerunning the full stack and
+confirming (a) no more buffer-exceeded spam, (b) `/odom` publishes at a
+steady rate, and (c) Nav2 goals actually complete instead of timing out.
