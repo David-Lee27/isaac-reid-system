@@ -513,3 +513,23 @@ structured. Also fixes the same class of bug for people/movers, though
 they were unaffected in practice since they use explicit translate ops.
 
 **Not yet re-tested.**
+
+## ATTEMPT 2: get_translate() fix alone wasn't enough - switched to RigidPrim
+
+After the ComputeLocalToWorldTransform fix above, arrival STILL never
+triggered across multiple dispatch alerts and confirmed-completing Nav2
+goals. Suspected cause: Isaac Sim's physics runs on an internal fast data
+layer ("Fabric") for performance, and does not reliably write simulation
+results back into the USD stage's authored xform attributes - the robot
+visually moves correctly (rendering reads from Fabric directly), but
+anything reading raw USD attributes (including ComputeLocalToWorldTransform)
+can still see stale/default data.
+
+**Fix:** `update_robot()` now queries the robot's position via
+`isaacsim.core.prims.RigidPrim.get_world_poses()`, which reads the live
+physics simulation state directly rather than USD stage attributes. Also
+added a debug print every arrival check showing current position, target,
+and distance, so if this still doesn't work we can see the actual numbers
+instead of guessing blind again.
+
+**Not yet re-tested.**

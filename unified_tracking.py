@@ -169,6 +169,7 @@ import random
 import math
 from datetime import datetime, timezone
 from isaacsim.sensors.camera import Camera
+from isaacsim.core.prims import RigidPrim
 
 
 # ---------- Movement helpers ----------
@@ -367,9 +368,20 @@ def update_robot(robot_state, elapsed, authorized_ids):
     if alert is None:
         return
 
-    current = get_translate(robot_state["prim"])
+    # Query the LIVE physics position directly via RigidPrim, not the USD
+    # stage's authored xform attributes. PhysX runs on a fast internal data
+    # layer ("Fabric") for performance and does not reliably write results
+    # back into the USD stage attributes that UsdGeom.Xformable reads from -
+    # the robot visually moves fine (rendering reads from Fabric directly),
+    # but get_translate() was reading stale/default data, so arrival never
+    # triggered no matter how close the robot actually got. get_world_poses()
+    # queries the physics simulation state directly and is reliable.
+    positions, _ = robot_state["rigid_prim"].get_world_poses()
+    current = positions[0]
     target = alert["coords"]
     dist = math.hypot(current[0] - target[0], current[1] - target[1])
+    print(f"  [ROBOT] checking arrival: at ({current[0]:.2f}, {current[1]:.2f}), "
+          f"target ({target[0]:.2f}, {target[1]:.2f}), dist={dist:.2f}m")
     if dist <= ARRIVAL_RADIUS:
         scan_robot(ROBOT_CAMERA_PATH, authorized_ids, alert)
         robot_state["handled_timestamps"].add(alert["timestamp"])
@@ -819,8 +831,11 @@ def main():
         with open(PATROL_WAYPOINTS_FILE, "w") as f:
             json.dump({"waypoints": [[x, y] for x, y, _ in ROBOT_WAYPOINTS]}, f, indent=2)
 
+        robot_rigid_prim = RigidPrim(prim_paths_expr=ROBOT_BASE_PATH)
+
         robot_state = {
             "prim": robot_base_prim,
+            "rigid_prim": robot_rigid_prim,
             "last_check": 0,
             "handled_timestamps": set(),
         }
