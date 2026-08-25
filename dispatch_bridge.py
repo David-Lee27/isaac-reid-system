@@ -36,7 +36,10 @@ EVENT_LOG_FILE = "/mnt/c/isaacsim/projects/surveillance-proj/event_log.json"
 PATROL_WAYPOINTS_FILE = "/mnt/c/isaacsim/projects/surveillance-proj/robot_patrol_waypoints.json"
 
 POLL_INTERVAL = 2.0        # seconds between checking for new dispatch alerts
-GOAL_TIMEOUT = 60          # seconds to wait for a nav goal before giving up
+GOAL_TIMEOUT = 240        # seconds to wait for a nav goal before giving up - generous
+                          # because unified_tracking.py's camera sweeps still block the
+                          # sim's main loop for several seconds each (~every 8s), so real
+                          # navigation progress is slower than wall-clock time suggests
 
 GOAL_TEMPLATE = (
     "{{pose: {{header: {{frame_id: 'map'}}, "

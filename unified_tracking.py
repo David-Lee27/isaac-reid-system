@@ -127,6 +127,12 @@ import os
 os.environ["ROS_DISTRO"] = "humble"
 os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
 os.environ["PATH"] = os.environ["PATH"] + ";c:/isaacsim/exts/isaacsim.ros2.core/humble/lib"
+# Silence the ROS2 bridge's own logger (separate from the carb log-level
+# settings below - the "[PoseTree] ... getObjectType eInvalid" spam comes
+# from here, not carb, so it wasn't being caught by /log/level=Error).
+# These are non-fatal warnings from the known broken TF frames on this
+# robot asset (see NOTES.md) - harmless, just very noisy.
+os.environ["RCUTILS_LOGGING_SEVERITY_THRESHOLD"] = "ERROR"
 
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": HEADLESS})
@@ -152,7 +158,7 @@ carb.settings.get_settings().set("/log/outputStreamLevel", "Error")
 
 import omni.usd
 import omni.timeline
-from pxr import Gf, UsdGeom, UsdPhysics
+from pxr import Gf, Usd, UsdGeom, UsdPhysics
 import cv2
 import numpy as np
 import subprocess
@@ -168,11 +174,18 @@ from isaacsim.sensors.camera import Camera
 # ---------- Movement helpers ----------
 
 def get_translate(prim):
+    # NOTE: this used to just look for a literal `translate` xformOp and
+    # return (0,0,0) if none was found - fine while the robot was
+    # kinematic-teleported (we created that op ourselves), but PhysX writes
+    # physics-driven position updates through a different representation
+    # (a combined transform matrix), so that approach silently always
+    # returned (0,0,0) for the real-physics robot and update_robot() never
+    # detected arrival no matter how close it actually got. Computing the
+    # full local-to-world transform works regardless of how the underlying
+    # ops are structured.
     xform = UsdGeom.Xformable(prim)
-    for op in xform.GetOrderedXformOps():
-        if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
-            return op.Get()
-    return Gf.Vec3d(0, 0, 0)
+    matrix = xform.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+    return matrix.ExtractTranslation()
 
 
 def set_translate(prim, pos):

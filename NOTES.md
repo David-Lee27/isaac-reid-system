@@ -487,3 +487,29 @@ now only ever initialized once, on its first use.
 **Not yet re-tested** - next step is rerunning the full stack and
 confirming (a) no more buffer-exceeded spam, (b) `/odom` publishes at a
 steady rate, and (c) Nav2 goals actually complete instead of timing out.
+
+## FIXED: robot arrival never detected (get_translate always returned 0,0,0)
+
+After the odom-rate and goal-timeout fixes above, Nav2 goals were
+confirmed completing ("goal finished" in dispatch_bridge.py), but
+unified_tracking.py's console never printed `[ROBOT] arrived at...` no
+matter how long a goal ran or how many alerts fired.
+
+Root cause: `get_translate()` only ever looked for a literal `translate`
+xformOp on the prim, falling back to `(0,0,0)` if none was found. That was
+fine while the robot was kinematic-teleported, since our own code created
+that exact op. But with kinematic OFF and PhysX driving the robot for
+real, position updates get written through a different xform
+representation (a combined transform matrix), not a separate translate op
+- so `get_translate()` was silently returning `(0,0,0)` for the robot on
+every call, meaning `update_robot()`'s distance-to-alert check was always
+comparing against the origin instead of the robot's real position, and
+never triggering arrival no matter how close it actually got.
+
+**Fix:** `get_translate()` now computes the prim's full local-to-world
+transform (`ComputeLocalToWorldTransform`) and extracts translation from
+that, which works correctly regardless of how the underlying xformOps are
+structured. Also fixes the same class of bug for people/movers, though
+they were unaffected in practice since they use explicit translate ops.
+
+**Not yet re-tested.**
