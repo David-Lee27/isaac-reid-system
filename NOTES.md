@@ -575,6 +575,32 @@ passes `params_file:="$PROJECT_DIR/nav2_params.yaml"` to the Nav2 launch.
 
 **Not yet re-tested.**
 
+## FOUND: real root cause of "Failed to make progress" - wall-clock vs sim-clock mismatch
+
+After the speed bump, goals started timing out at 240s with no ABORTED at
+all - a different failure mode. Nav2 log showed the real cause:
+`Planner loop missed its desired rate of 20.0000 Hz. Current loop rate is
+1.4031 Hz` and similar for the control loop. Isaac Sim's simulation is
+running noticeably slower than real time (rendering + camera captures +
+subprocess overhead), but Nav2's progress checker and control loop timing
+use REAL wall-clock time by default (`use_sim_time` was never set, so it
+defaulted to false everywhere). This meant Nav2's "robot must move 0.5m
+within a 10-second window or abort" check was being judged against real
+seconds, while actual simulated robot movement during that window was much
+smaller than it should be because the sim itself was running slow -
+a fundamental clock mismatch, not a speed or physics-starvation problem.
+
+**Fix:** `start_nav_stack.sh` now passes `use_sim_time:=true` to the Nav2
+bringup launch, and the static_transform_publisher is now launched with
+`--ros-args -p use_sim_time:=true` too (switched from positional args to
+`--x/--y/--frame-id` flags to support this). Isaac Sim already publishes
+`/clock` via its ROS2 bridge (confirmed present in `ros2 topic list`
+earlier), so no changes needed on the Isaac Sim side - Nav2's internal
+timers should now scale with however fast/slow the sim is actually
+running instead of racing against real time.
+
+**Not yet re-tested.**
+
 ## ATTEMPT 2: get_translate() fix alone wasn't enough - switched to RigidPrim
 
 After the ComputeLocalToWorldTransform fix above, arrival STILL never

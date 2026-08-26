@@ -29,7 +29,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "[1/4] Starting static_transform_publisher (map -> odom)..."
-ros2 run tf2_ros static_transform_publisher -13.84 5.06 0 0 0 0 map odom \
+ros2 run tf2_ros static_transform_publisher --x -13.84 --y 5.06 --z 0 --roll 0 --pitch 0 --yaw 0 \
+    --frame-id map --child-frame-id odom --ros-args -p use_sim_time:=true \
     > "$LOG_DIR/tf.log" 2>&1 &
 PIDS+=($!)
 sleep 2
@@ -45,6 +46,7 @@ echo "[2/4] Launching Nav2 bringup (this takes a bit)..."
 ros2 launch nav2_bringup bringup_launch.py \
     map:=/home/popli/warehouse_map.yaml \
     params_file:="$PROJECT_DIR/nav2_params.yaml" \
+    use_sim_time:=true \
     > "$LOG_DIR/nav2.log" 2>&1 &
 PIDS+=($!)
 
