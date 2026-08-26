@@ -557,6 +557,24 @@ cache fix, but sweep-duration stalls remained and were long enough to
 starve navigation specifically, even though basic odom publishing looked
 fine in isolation).
 
+## Robot speed increased + custom nav2_params.yaml added
+
+Once navigation was actually working, the robot's real driving speed felt
+too slow (default Nav2 caps: ~0.5 m/s linear, ~1.9 rad/s angular) and the
+controller was hitting "Failed to make progress" aborts, partly from
+residual sweep-timing stalls and partly from just being slow relative to
+its patience window.
+
+Copied `/opt/ros/jazzy/share/nav2_bringup/params/nav2_params.yaml` into the
+project as `nav2_params.yaml` (so it can be tuned without touching the
+system ROS install) and bumped: `FollowPath.vx_max` 0.5 -> 1.2,
+`FollowPath.wz_max` 1.9 -> 2.5, and matching `velocity_smoother.max_velocity`
+/ `max_accel` values (the smoother otherwise clamps speed right back down
+regardless of what the controller requests). `start_nav_stack.sh` now
+passes `params_file:="$PROJECT_DIR/nav2_params.yaml"` to the Nav2 launch.
+
+**Not yet re-tested.**
+
 ## ATTEMPT 2: get_translate() fix alone wasn't enough - switched to RigidPrim
 
 After the ComputeLocalToWorldTransform fix above, arrival STILL never

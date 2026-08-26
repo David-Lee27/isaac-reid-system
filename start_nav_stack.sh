@@ -42,7 +42,9 @@ else
 fi
 
 echo "[2/4] Launching Nav2 bringup (this takes a bit)..."
-ros2 launch nav2_bringup bringup_launch.py map:=/home/popli/warehouse_map.yaml \
+ros2 launch nav2_bringup bringup_launch.py \
+    map:=/home/popli/warehouse_map.yaml \
+    params_file:="$PROJECT_DIR/nav2_params.yaml" \
     > "$LOG_DIR/nav2.log" 2>&1 &
 PIDS+=($!)
 
