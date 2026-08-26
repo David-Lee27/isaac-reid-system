@@ -454,17 +454,27 @@ def capture_frame(camera_path, resolution=(640, 480)):
 def run_subprocess(script_name, args):
     script_path = os.path.join(PROJECT_DIR, script_name)
     arg_str = " ".join(f'"{a}"' for a in args)
-    result = subprocess.run(
+    # Was subprocess.run() (fully blocking) - during that block,
+    # simulation_app.update() never ran, so PhysX never stepped and Nav2's
+    # /cmd_vel commands never actually got applied to the robot, even though
+    # they kept arriving fine on the ROS2 wire (which is why `ros2 topic hz`
+    # looked healthy while the robot barely moved). Using Popen + polling
+    # keeps physics/rendering stepping the whole time this runs.
+    proc = subprocess.Popen(
         f'"C:\\isaacsim\\python.bat" "{script_path}" {arg_str}',
-        shell=True, capture_output=True, text=True,
-        encoding="utf-8", errors="replace"
+        shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace"
     )
-    if result.returncode != 0:
-        return {"error": result.stderr}
+    while proc.poll() is None:
+        simulation_app.update()
+        time.sleep(0.01)
+    stdout, stderr = proc.communicate()
+    if proc.returncode != 0:
+        return {"error": stderr}
     try:
-        return json.loads(result.stdout.strip().splitlines()[-1])
+        return json.loads(stdout.strip().splitlines()[-1])
     except (json.JSONDecodeError, IndexError):
-        return {"error": f"failed to parse output: {result.stdout}"}
+        return {"error": f"failed to parse output: {stdout}"}
 
 
 def crop_person(bgr_image, detection, padding=25):

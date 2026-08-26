@@ -514,6 +514,49 @@ they were unaffected in practice since they use explicit translate ops.
 
 **Not yet re-tested.**
 
+## FOUND: real root cause - blocking subprocess calls starved physics stepping
+
+After the RigidPrim fix, position tracking was confirmed accurate (debug
+print showed sensible, live coordinates), but the robot still barely moved
+(under 0.2m of real drift over 9 minutes) and `dispatch_bridge.py` reported
+goals as "finished" when they were actually ending with status ABORTED
+(confirmed via `ros2 action send_goal` run manually and reading the full
+Result block - dispatch_bridge.py was only checking for the string "Goal
+was rejected" as a failure condition, missing ABORTED/CANCELED entirely).
+
+Nav2's own log showed a repeating `follow_path aborting -> spin/backup
+recovery -> follow_path aborting` cycle for the full goal duration - the
+classic "robot isn't actually making progress" pattern. `ros2 topic hz
+/cmd_vel_nav` and `/cmd_vel` both showed healthy ~20Hz with real nonzero
+velocity values reaching the robot, and the map's origin/bounds checked out
+fine for the target coordinates - so the problem wasn't Nav2, the relay, or
+the map. Confirmed visually: the robot was not moving on screen at all
+during an active goal.
+
+**Root cause:** `run_sweep()`'s YOLO/DeepFace calls used
+`subprocess.run()` - fully blocking. `ros2 topic hz` measures messages on
+the ROS2 DDS wire, which is completely independent of whether Isaac Sim is
+actually stepping physics to consume them. While `run_subprocess()` blocked
+(confirmed earlier at 9-15+ seconds per call), `simulation_app.update()`
+never ran, so PhysX never stepped - meaning `/cmd_vel` commands kept
+arriving on the wire the whole time but were never actually applied to the
+robot. With sweeps every 8s and blocks often longer than that, the sim was
+frozen for a large fraction of total time, so Nav2 saw a robot barely
+making progress and kept aborting/recovering.
+
+**Fix:** `run_subprocess()` now uses `subprocess.Popen()` and polls it in a
+loop that keeps calling `simulation_app.update()` the whole time the
+subprocess runs, instead of blocking completely. Also fixed
+`dispatch_bridge.py` to check the actual result status (SUCCEEDED/
+ABORTED/CANCELED) instead of just the absence of "Goal was rejected", so
+it stops silently reporting failed goals as successes.
+
+**Not yet re-tested** - this is the most likely real fix given how well it
+explains every symptom observed (odom jitter fixed by the earlier camera
+cache fix, but sweep-duration stalls remained and were long enough to
+starve navigation specifically, even though basic odom publishing looked
+fine in isolation).
+
 ## ATTEMPT 2: get_translate() fix alone wasn't enough - switched to RigidPrim
 
 After the ComputeLocalToWorldTransform fix above, arrival STILL never

@@ -81,7 +81,13 @@ def send_nav_goal(x, y, label):
     """Blocks until Nav2 reports success/failure or GOAL_TIMEOUT is hit.
     Uses the plain `ros2 action send_goal` CLI (synchronous, blocks until
     the action completes) rather than rclpy, since it's already confirmed
-    working end-to-end and keeps this script dependency-free."""
+    working end-to-end and keeps this script dependency-free.
+
+    NOTE: originally only checked for the literal string "Goal was rejected"
+    as a failure - meaning goals that were ACCEPTED but later ABORTED (which
+    turned out to be the actual common case - see NOTES.md) were silently
+    reported as successes. Now explicitly checks the real result status.
+    """
     goal_str = GOAL_TEMPLATE.format(x=x, y=y)
     cmd = (
         f"ros2 action send_goal /navigate_to_pose "
@@ -105,8 +111,19 @@ def send_nav_goal(x, y, label):
         print(f"[dispatch_bridge] goal command failed: {result.stderr.strip()[:300]}")
         return False
 
-    print(f"[dispatch_bridge] goal finished: {label}")
-    return True
+    if "status: SUCCEEDED" in result.stdout:
+        print(f"[dispatch_bridge] goal SUCCEEDED: {label}")
+        return True
+    elif "status: ABORTED" in result.stdout:
+        print(f"[dispatch_bridge] goal ABORTED (accepted but failed mid-navigation): {label}")
+        return False
+    elif "status: CANCELED" in result.stdout:
+        print(f"[dispatch_bridge] goal CANCELED: {label}")
+        return False
+    else:
+        print(f"[dispatch_bridge] goal ended with unrecognized status, treating as failure: {label}")
+        print(f"  raw output tail: {result.stdout.strip()[-300:]}")
+        return False
 
 
 def main():
