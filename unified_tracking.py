@@ -137,6 +137,15 @@ os.environ["RCUTILS_LOGGING_SEVERITY_THRESHOLD"] = "ERROR"
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": HEADLESS})
 
+# Raise Isaac Sim's own engine log threshold BEFORE enabling the ROS2 bridge
+# extension below (moved earlier than before) so its startup/tick logging
+# channel is subject to this setting from its very first log call, rather
+# than being registered before we lowered the threshold.
+import carb
+carb.settings.get_settings().set("/log/level", "Error")
+carb.settings.get_settings().set("/log/fileLogLevel", "Error")
+carb.settings.get_settings().set("/log/outputStreamLevel", "Error")
+
 # Explicitly enable the ROS2 bridge extension - toggling it on manually in
 # the GUI only applies to that running session and does NOT carry over to a
 # fresh script launch. Without this, /odom, /cmd_vel, /tf etc. are absent
@@ -147,14 +156,6 @@ ext_manager.set_extension_enabled_immediate("isaacsim.ros2.bridge", True)
 print("ROS2 bridge extension explicitly enabled.")
 for _ in range(20):
     simulation_app.update()
-
-# Raise Isaac Sim's own engine log threshold so routine warnings (camera
-# aperture math, DLSS resolution notes, "annotator returned None" render
-# warmup messages, etc.) stop flooding the console - only real errors show.
-import carb
-carb.settings.get_settings().set("/log/level", "Error")
-carb.settings.get_settings().set("/log/fileLogLevel", "Error")
-carb.settings.get_settings().set("/log/outputStreamLevel", "Error")
 
 import omni.usd
 import omni.timeline
@@ -173,6 +174,79 @@ from isaacsim.core.prims import RigidPrim
 
 
 # ---------- Movement helpers ----------
+
+def repair_broken_tf_publisher_targets(stage):
+    """The robot asset has long-known broken TF frames (base_link,
+    lidar_frame, etc. reporting '[PoseTree] getObjectType eInvalid' every
+    tick - see NOTES.md). This was previously treated as harmless log noise,
+    but it likely also means Nav2's obstacle-avoidance costmap can't
+    correctly place lidar points (it needs a working transform from each
+    scan's frame to the costmap's frame) - consistent with the robot
+    driving straight into a pillar despite genuine navigation working.
+
+    Rather than hand-guessing which exact prim paths are broken and what
+    they should be instead (risky and asset-specific), this walks every
+    USD relationship stage-wide looking for 'target'/'parent'-type
+    relationships (how OmniGraph nodes like the ROS2 TF-tree publisher
+    store their prim references under the hood) whose targets don't
+    resolve to a valid prim, and tries to repair each one by finding a
+    valid prim elsewhere in the robot's hierarchy with the exact same leaf
+    name. Self-healing where the match is unambiguous; loudly prints
+    exactly what it could and couldn't fix otherwise, rather than silently
+    guessing.
+    """
+    robot_prim = stage.GetPrimAtPath(ROBOT_PRIM_PATH)
+    if not robot_prim.IsValid():
+        print("  [tf_repair] robot prim not found, skipping.")
+        return
+
+    name_to_paths = {}
+    for prim in Usd.PrimRange(robot_prim):
+        name_to_paths.setdefault(prim.GetName(), []).append(prim.GetPath())
+
+    checked = 0
+    repaired = 0
+    unresolved = []
+
+    for prim in Usd.PrimRange(stage.GetPseudoRoot()):
+        for rel in prim.GetRelationships():
+            rel_name = rel.GetName()
+            if "target" not in rel_name.lower() and "parent" not in rel_name.lower():
+                continue
+            targets = rel.GetTargets()
+            if not targets:
+                continue
+            new_targets = []
+            changed = False
+            for t in targets:
+                checked += 1
+                t_prim = stage.GetPrimAtPath(t)
+                if t_prim.IsValid():
+                    new_targets.append(t)
+                    continue
+                leaf = t.name
+                candidates = name_to_paths.get(leaf, [])
+                if len(candidates) == 1:
+                    fixed = candidates[0]
+                    print(f"  [tf_repair] {prim.GetPath()}.{rel_name}: {t} -> {fixed}")
+                    new_targets.append(fixed)
+                    changed = True
+                    repaired += 1
+                else:
+                    unresolved.append((str(prim.GetPath()), rel_name, str(t), len(candidates)))
+                    new_targets.append(t)
+            if changed:
+                try:
+                    rel.SetTargets(new_targets)
+                except Exception as e:
+                    print(f"  [tf_repair] failed to apply fix on {prim.GetPath()}.{rel_name}: {e}")
+
+    print(f"  [tf_repair] checked {checked} relationship target(s) stage-wide, repaired {repaired}.")
+    if unresolved:
+        print(f"  [tf_repair] {len(unresolved)} target(s) NOT auto-repaired (ambiguous or no same-name match):")
+        for node_path, rel_name, t_str, n in unresolved[:15]:
+            print(f"    {node_path}.{rel_name}: {t_str} (found {n} same-name candidates)")
+
 
 def get_translate(prim):
     # NOTE: this used to just look for a literal `translate` xformOp and
@@ -803,6 +877,9 @@ def main():
         print("Piper arm payload unloaded (disabled).")
     else:
         print("WARNING: piper_arm prim not found - nothing to unload.")
+
+    print("Attempting to repair broken TF publisher prim references...")
+    repair_broken_tf_publisher_targets(stage)
 
     movers = []
     for name, info in PEOPLE.items():

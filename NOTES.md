@@ -514,6 +514,59 @@ they were unaffected in practice since they use explicit translate ops.
 
 **Not yet re-tested.**
 
+## FOUND (confirmed): robot drove into a pillar - costmap was never getting real lidar data
+
+User reported the robot physically drove into a wall/pillar, and goals kept
+timing out (240s, no ABORTED) even after the use_sim_time fix. Checked
+`ros2 topic list` from earlier in the session: the actual published lidar
+topics are `/lidar_front/scan` and `/lidar_rear/scan` - there is NO topic
+named `/scan`. But `nav2_params.yaml`'s local_costmap and global_costmap
+obstacle/voxel layers were both configured with `observation_sources: scan`
+pointing at `topic: /scan` (the stock default from the upstream Nav2
+template, never updated for this robot's actual topic names). This means
+Nav2 has had ZERO real-time obstacle awareness this entire time - it was
+navigating using only the static pre-built map, with no live lidar feeding
+the costmap at all, which is exactly consistent with driving straight into
+a physical obstacle that happened to sit in its path.
+
+**Fix (confirmed root cause, high confidence):** `nav2_params.yaml`'s
+local_costmap and global_costmap now each define two observation sources,
+`scan_front` and `scan_rear`, pointing at the real topics `/lidar_front/scan`
+and `/lidar_rear/scan` respectively. Also added matching `scan_front`/
+`scan_rear` sources to `collision_monitor`'s observation_sources (was also
+pointing at the nonexistent `scan` topic).
+
+## ADDED (defensive/exploratory): self-healing TF relationship repair
+
+Separately, the long-standing `[PoseTree] getObjectType eInvalid` spam for
+base_link/lidar_frame/etc. (documented as a known issue previously) could
+ALSO independently block obstacle avoidance even with the topic fix above,
+since Nav2 needs a working transform from each LaserScan's frame to the
+costmap's frame to place obstacle points correctly. Rather than guessing
+blind at which exact prim paths are broken and what to replace them with
+(no way to safely verify without live introspection), added
+`repair_broken_tf_publisher_targets()` to `unified_tracking.py`, which runs
+once at startup and:
+1. Walks every USD relationship stage-wide looking for 'target'/'parent'
+   type relationships (how OmniGraph node prim-references are actually
+   stored at the USD level) whose targets don't resolve to a valid prim.
+2. For each broken one, searches the robot's real prim hierarchy for a
+   valid prim with the exact same leaf name and repairs the reference if
+   the match is unambiguous.
+3. Prints exactly what it checked/fixed/couldn't confidently fix, so the
+   next run's console output tells us definitively whether this worked,
+   rather than more guessing.
+
+This uses only core, stable USD Python API calls (Usd.PrimRange,
+GetRelationships, GetTargets, SetTargets) rather than the OmniGraph node
+API directly, to minimize risk of the repair code itself failing due to
+API version differences - if it can't find/fix anything it fails safe and
+just prints so, without blocking the rest of the script.
+
+**Not yet re-tested - both fixes need a real run to confirm.** Watch the
+console for `[tf_repair]` output and check whether the robot now visibly
+steers around obstacles instead of driving through them.
+
 ## FOUND: real root cause - blocking subprocess calls starved physics stepping
 
 After the RigidPrim fix, position tracking was confirmed accurate (debug
