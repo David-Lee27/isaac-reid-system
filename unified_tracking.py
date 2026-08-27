@@ -135,22 +135,39 @@ os.environ["PATH"] = os.environ["PATH"] + ";c:/isaacsim/exts/isaacsim.ros2.core/
 os.environ["RCUTILS_LOGGING_SEVERITY_THRESHOLD"] = "ERROR"
 
 from isaacsim import SimulationApp
-simulation_app = SimulationApp({"headless": HEADLESS})
 
-# Raise Isaac Sim's own engine log threshold BEFORE enabling the ROS2 bridge
-# extension below (moved earlier than before) so its startup/tick logging
-# channel is subject to this setting from its very first log call, rather
-# than being registered before we lowered the threshold.
+# All of the settings below are passed directly into SimulationApp's launch
+# config instead of being set afterward via carb.settings.set(). This is a
+# deliberate change: post-hoc carb.settings calls (even moved as early as
+# possible in the script, even before enabling the ROS2 bridge extension)
+# were confirmed NOT to suppress the PoseTree log spam or fix the
+# "sequence size exceeds remaining buffer" issue across two separate
+# attempts. Extension logging channels and some renderer internals are
+# locked in at Kit's actual process startup - passing these as launch
+# config is the earliest possible point, before any extension registers,
+# and is far more likely to actually take effect.
+simulation_app = SimulationApp({
+    "headless": HEADLESS,
+    "width": 640,
+    "height": 480,
+    "/log/level": "Error",
+    "/log/fileLogLevel": "Error",
+    "/log/outputStreamLevel": "Error",
+    "/rtx/scenedb/maxHistoryTransformCount": 512,
+    "/rtx/pathtracing/enabled": False,
+    "/rtx/reflections/enabled": False,
+    "/rtx/ambientOcclusion/enabled": False,
+    "/rtx/indirectDiffuseGI/enabled": False,
+    "/rtx/directLighting/sampledLighting/enabled": False,
+    "/rtx/post/dlss/execMode": 0,
+})
+
 import carb
-carb.settings.get_settings().set("/log/level", "Error")
-carb.settings.get_settings().set("/log/fileLogLevel", "Error")
-carb.settings.get_settings().set("/log/outputStreamLevel", "Error")
-# Per-channel overrides - the global /log/level above does NOT reliably
-# catch every extension's logging channel (confirmed: PoseTree eInvalid
-# spam from isaacsim.ros2.nodes kept appearing despite the global setting).
-# Try both the settings-path form and the direct channel API defensively,
-# since exact API surface can vary by Kit version - failing safe if either
-# doesn't apply rather than crashing startup.
+# Per-channel log suppression still needs to happen via Python calls (no
+# launch-config equivalent for arbitrary channel names), but now runs
+# immediately after SimulationApp() instead of after enabling the ROS2
+# bridge extension, so it's in place before that extension's nodes start
+# ticking and logging.
 for _channel in ("isaacsim.ros2.nodes", "isaacsim.ros2.bridge", "isaacsim.ros2.core",
                   "omni.hydra", "rtx.hydra", "omni.syntheticdata.plugin",
                   "isaacsim.sensors.camera.camera", "rtx.scenedb.plugin"):
@@ -165,30 +182,6 @@ try:
         omni.log.set_channel_enabled(_channel, False, omni.log.SettingBehavior.OVERRIDE)
 except Exception:
     pass
-
-# "sequence size exceeds remaining buffer" spam - this is a REAL fix, not
-# just log suppression. It comes from rtx.scenedb's transform-history ring
-# buffer overflowing; a related warning earlier in the log literally names
-# the fix: "Consider allow a larger storage for transforms through
-# --/rtx/scenedb/maxHistoryTransformCount=245". Bumping this setting
-# addresses the actual root cause instead of hiding the symptom.
-carb.settings.get_settings().set("/rtx/scenedb/maxHistoryTransformCount", 512)
-
-# Lower rendering fidelity for speed, as requested - flat/bright lighting
-# means the renderer doesn't need to compute expensive indirect
-# lighting/reflections to produce a usable frame for detection.
-carb.settings.get_settings().set("/rtx/pathtracing/enabled", False)
-for _setting, _value in [
-    ("/rtx/reflections/enabled", False),
-    ("/rtx/ambientOcclusion/enabled", False),
-    ("/rtx/indirectDiffuseGI/enabled", False),
-    ("/rtx/directLighting/sampledLighting/enabled", False),
-    ("/rtx/post/dlss/execMode", 0),
-]:
-    try:
-        carb.settings.get_settings().set(_setting, _value)
-    except Exception:
-        pass
 
 # Explicitly enable the ROS2 bridge extension - toggling it on manually in
 # the GUI only applies to that running session and does NOT carry over to a

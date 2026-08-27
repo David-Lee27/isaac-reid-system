@@ -616,6 +616,37 @@ running it) - the next run's console output (noise level + how many
 real test. The goal-standoff fix is straightforward, high-confidence logic
 and should visibly stop the wall-driving behavior.
 
+## FOUND: post-hoc carb.settings calls don't work - moved everything into SimulationApp() launch config
+
+Confirmed via a fresh run: the log-noise and render-speed fixes above did
+NOTHING - identical PoseTree/buffer spam, no speed change. Root cause:
+settings applied via `carb.settings.get_settings().set(...)` AFTER
+`SimulationApp()` has already run are too late for a lot of this. Extension
+logging channels get registered and some renderer internals get locked in
+at Kit's actual process startup, before our Python code runs at all - this
+held true even when the settings calls were moved as early as possible in
+the script (immediately after SimulationApp(), before enabling the ROS2
+bridge extension) in the previous attempt.
+
+**Fix:** moved every log-level and rendering setting directly into the
+`SimulationApp({...})` constructor dict itself, since that config is what
+SimulationApp uses to build Kit's actual startup command line - the
+earliest possible point settings can apply, before any extension
+registers. Also added `"width": 640, "height": 480` to shrink the
+interactive viewport (a real, direct rendering-cost reduction, separate
+from the camera capture resolutions used for detection). Per-channel log
+suppression (`/log/channels/...`) still has to happen via Python calls
+since there's no launch-config equivalent for arbitrary channel names, but
+now runs immediately after SimulationApp() instead of later.
+
+Also flagged for the user: the single biggest available speed lever is
+switching `HEADLESS = True` at the top of the file - GUI mode renders a
+full interactive window every frame in addition to every camera capture,
+and the user has mentioned the GUI freezes so much they don't really watch
+it live anyway.
+
+**Not yet re-tested.**
+
 ## FOUND: real root cause - blocking subprocess calls starved physics stepping
 
 After the RigidPrim fix, position tracking was confirmed accurate (debug
