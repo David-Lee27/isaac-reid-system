@@ -647,6 +647,25 @@ it live anyway.
 
 **Not yet re-tested.**
 
+## CONFIRMED WORKING: log-noise fixes actually worked this time
+
+Re-ran with settings moved into the SimulationApp() launch config -
+confirmed: PoseTree eInvalid spam is gone (0 occurrences vs. hundreds
+before), "sequence size exceeds remaining buffer" is completely gone, and
+the sim isn't stalling/freezing the way it used to. The launch-config
+approach was the right fix.
+
+Remaining noise is low-volume, one-time-per-source warnings (not spam
+loops): camera_info_utils aperture-mismatch warnings, omni.timeline
+deprecation notice, a couple of carb performance-warning notices, and the
+synthetic-data "counter-performant" rendervar copy note. Added those
+channels (`isaacsim.ros2.core.impl.camera_info_utils`, `omni.timeline.plugin`,
+`carb`) to the per-channel suppression list, and fixed the aperture warning
+at the actual source: `capture_frame()` now explicitly sets each camera's
+horizontal/vertical aperture to match its resolution's aspect ratio at
+creation time, instead of letting Isaac Sim silently auto-correct (and log
+about) it on every access.
+
 ## FOUND: real root cause - blocking subprocess calls starved physics stepping
 
 After the RigidPrim fix, position tracking was confirmed accurate (debug

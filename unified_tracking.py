@@ -170,7 +170,9 @@ import carb
 # ticking and logging.
 for _channel in ("isaacsim.ros2.nodes", "isaacsim.ros2.bridge", "isaacsim.ros2.core",
                   "omni.hydra", "rtx.hydra", "omni.syntheticdata.plugin",
-                  "isaacsim.sensors.camera.camera", "rtx.scenedb.plugin"):
+                  "isaacsim.sensors.camera.camera", "rtx.scenedb.plugin",
+                  "isaacsim.ros2.core.impl.camera_info_utils", "omni.timeline.plugin",
+                  "carb"):
     try:
         carb.settings.get_settings().set(f"/log/channels/{_channel}/level", "Error")
         carb.settings.get_settings().set(f"/log/channels/{_channel}/enabled", False)
@@ -544,6 +546,12 @@ def capture_frame(camera_path, resolution=(640, 480)):
     if camera is None:
         camera = Camera(prim_path=camera_path, resolution=resolution)
         camera.initialize()
+        # Set aperture to match this resolution's aspect ratio up front -
+        # otherwise Isaac Sim silently auto-corrects it (and logs a warning)
+        # every time. Real fix instead of just suppressing the warning.
+        aspect = resolution[0] / resolution[1]
+        camera.set_horizontal_aperture(2.0955)
+        camera.set_vertical_aperture(2.0955 / aspect)
         _camera_cache[camera_path] = camera
         for _ in range(10):
             simulation_app.update()
