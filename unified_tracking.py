@@ -145,6 +145,50 @@ import carb
 carb.settings.get_settings().set("/log/level", "Error")
 carb.settings.get_settings().set("/log/fileLogLevel", "Error")
 carb.settings.get_settings().set("/log/outputStreamLevel", "Error")
+# Per-channel overrides - the global /log/level above does NOT reliably
+# catch every extension's logging channel (confirmed: PoseTree eInvalid
+# spam from isaacsim.ros2.nodes kept appearing despite the global setting).
+# Try both the settings-path form and the direct channel API defensively,
+# since exact API surface can vary by Kit version - failing safe if either
+# doesn't apply rather than crashing startup.
+for _channel in ("isaacsim.ros2.nodes", "isaacsim.ros2.bridge", "isaacsim.ros2.core",
+                  "omni.hydra", "rtx.hydra", "omni.syntheticdata.plugin",
+                  "isaacsim.sensors.camera.camera", "rtx.scenedb.plugin"):
+    try:
+        carb.settings.get_settings().set(f"/log/channels/{_channel}/level", "Error")
+        carb.settings.get_settings().set(f"/log/channels/{_channel}/enabled", False)
+    except Exception:
+        pass
+try:
+    import omni.log
+    for _channel in ("isaacsim.ros2.nodes", "omni.hydra", "rtx.hydra"):
+        omni.log.set_channel_enabled(_channel, False, omni.log.SettingBehavior.OVERRIDE)
+except Exception:
+    pass
+
+# "sequence size exceeds remaining buffer" spam - this is a REAL fix, not
+# just log suppression. It comes from rtx.scenedb's transform-history ring
+# buffer overflowing; a related warning earlier in the log literally names
+# the fix: "Consider allow a larger storage for transforms through
+# --/rtx/scenedb/maxHistoryTransformCount=245". Bumping this setting
+# addresses the actual root cause instead of hiding the symptom.
+carb.settings.get_settings().set("/rtx/scenedb/maxHistoryTransformCount", 512)
+
+# Lower rendering fidelity for speed, as requested - flat/bright lighting
+# means the renderer doesn't need to compute expensive indirect
+# lighting/reflections to produce a usable frame for detection.
+carb.settings.get_settings().set("/rtx/pathtracing/enabled", False)
+for _setting, _value in [
+    ("/rtx/reflections/enabled", False),
+    ("/rtx/ambientOcclusion/enabled", False),
+    ("/rtx/indirectDiffuseGI/enabled", False),
+    ("/rtx/directLighting/sampledLighting/enabled", False),
+    ("/rtx/post/dlss/execMode", 0),
+]:
+    try:
+        carb.settings.get_settings().set(_setting, _value)
+    except Exception:
+        pass
 
 # Explicitly enable the ROS2 bridge extension - toggling it on manually in
 # the GUI only applies to that running session and does NOT carry over to a
@@ -512,7 +556,7 @@ def capture_frame(camera_path, resolution=(640, 480)):
             simulation_app.update()
 
     rgba = None
-    for i in range(150):
+    for i in range(60):
         simulation_app.update()
         rgba = camera.get_rgba()
         if rgba is not None and rgba.size > 0:
@@ -880,6 +924,24 @@ def main():
 
     print("Attempting to repair broken TF publisher prim references...")
     repair_broken_tf_publisher_targets(stage)
+
+    # Bump ambient/dome light intensity so the scene is flat-lit and bright
+    # enough for detection without needing expensive indirect
+    # lighting/GI bounces to look right - requested speed lever, applied
+    # directly to whatever light prims actually exist in the stage rather
+    # than guessing a carb setting name for "ambient light".
+    from pxr import UsdLux
+    lights_adjusted = 0
+    for prim in stage.Traverse():
+        if prim.IsA(UsdLux.DomeLight) or prim.IsA(UsdLux.DistantLight) or prim.IsA(UsdLux.SphereLight):
+            light = UsdLux.LightAPI(prim)
+            intensity_attr = light.GetIntensityAttr()
+            if intensity_attr:
+                intensity_attr.Set(2.0)
+            else:
+                light.CreateIntensityAttr(2.0)
+            lights_adjusted += 1
+    print(f"  Adjusted {lights_adjusted} light prim(s) to intensity 2.0 for flatter/cheaper lighting.")
 
     movers = []
     for name, info in PEOPLE.items():

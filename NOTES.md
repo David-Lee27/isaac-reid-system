@@ -567,6 +567,55 @@ just prints so, without blocking the rest of the script.
 console for `[tf_repair]` output and check whether the robot now visibly
 steers around obstacles instead of driving through them.
 
+## FOUND (confirmed): robot driving into corner was a GOAL PLACEMENT bug, not obstacle avoidance
+
+User sent a screenshot: robot literally parked against a wall-corner pillar,
+never able to reach goals. Real cause, now confirmed: `ZONE_CENTERS`
+coordinates are chosen for CAMERA FRAMING - they sit right at/against the
+walls the zone cameras are mounted near. Sending the robot literally TO
+that exact point means its destination is physically inside or hard
+against a wall - not a costmap/lidar/obstacle-avoidance failure at all.
+
+**Fix:** `dispatch_bridge.py` now applies `apply_goal_standoff()` before
+sending any alert-based goal - pulls the raw zone coordinate inward toward
+map center (0,0) by `GOAL_STANDOFF_METERS` (3.0m) so the robot's actual
+Nav2 goal is a reachable point near the zone instead of on top of the wall.
+
+## Log noise + render speed pass
+
+Three more fixes in the same pass, all in `unified_tracking.py`'s startup
+block:
+
+1. **"sequence size exceeds remaining buffer" - real fix, not suppression.**
+   This comes from rtx.scenedb's transform-history ring buffer overflowing;
+   an earlier, related warning literally names the fix:
+   `--/rtx/scenedb/maxHistoryTransformCount=245`. Set
+   `/rtx/scenedb/maxHistoryTransformCount` to 512 at startup.
+2. **`[PoseTree] eInvalid` spam** - the global `/log/level=Error` setting
+   never caught this channel. Added defensive per-channel suppression via
+   both `/log/channels/<channel>/level` settings-path overrides AND the
+   `omni.log.set_channel_enabled()` API (whichever the installed Kit
+   version actually supports), for `isaacsim.ros2.nodes` and a few other
+   noisy channels. Wrapped in try/except so an API mismatch fails silently
+   instead of crashing startup.
+3. **Render speed** - added `/rtx/pathtracing/enabled=False` and disabled
+   reflections/AO/indirect-GI/sampled-lighting via carb settings
+   (best-effort, version-dependent, wrapped safely), and bumped every
+   DomeLight/DistantLight/SphereLight in the stage to intensity 2.0 via
+   direct USD edits (guaranteed to apply, not a setting-name guess) for
+   flat, cheap-to-render lighting. Also reduced `capture_frame()`'s max
+   wait-loop from 150 to 60 `simulation_app.update()` calls, since the
+   camera-object caching fix means this rarely needs anywhere near that
+   many tries now.
+
+**None of these three re-tested yet.** The log-suppression and render-speed
+items are best-effort/version-dependent (multiple approaches tried
+defensively since the exact Kit API surface isn't verifiable without
+running it) - the next run's console output (noise level + how many
+"[log suppression didn't apply]"-style silent failures, if any) is the
+real test. The goal-standoff fix is straightforward, high-confidence logic
+and should visibly stop the wall-driving behavior.
+
 ## FOUND: real root cause - blocking subprocess calls starved physics stepping
 
 After the RigidPrim fix, position tracking was confirmed accurate (debug

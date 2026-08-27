@@ -28,6 +28,7 @@ Press Ctrl+C to stop.
 """
 
 import json
+import math
 import os
 import subprocess
 import time
@@ -40,6 +41,16 @@ GOAL_TIMEOUT = 240        # seconds to wait for a nav goal before giving up - ge
                           # because unified_tracking.py's camera sweeps still block the
                           # sim's main loop for several seconds each (~every 8s), so real
                           # navigation progress is slower than wall-clock time suggests
+
+# Zone-camera coordinates (ZONE_CENTERS in unified_tracking.py) are chosen
+# for camera FRAMING - they sit right up against the walls/corners the
+# cameras are mounted near. Sending the robot literally TO that exact point
+# means its destination is inside or hard against a wall, which is why it
+# kept driving into corners/pillars: not a costmap/obstacle-avoidance bug,
+# the goal itself was physically unreachable. Pull every dispatch goal
+# inward toward the map's rough center by this many meters before sending
+# it, so the robot parks near the alert zone instead of on top of the wall.
+GOAL_STANDOFF_METERS = 3.0
 
 GOAL_TEMPLATE = (
     "{{pose: {{header: {{frame_id: 'map'}}, "
@@ -75,6 +86,18 @@ def find_next_alert(handled_timestamps):
                 and e.get("timestamp") not in handled_timestamps):
             return e
     return None
+
+
+def apply_goal_standoff(x, y):
+    """Pulls a raw zone-center coordinate inward toward the map's rough
+    center (0,0) by GOAL_STANDOFF_METERS, so the robot's actual nav goal is
+    a reachable point near the alert zone instead of the exact wall-mounted
+    camera position."""
+    dist = math.hypot(x, y)
+    if dist <= GOAL_STANDOFF_METERS:
+        return x, y
+    scale = (dist - GOAL_STANDOFF_METERS) / dist
+    return x * scale, y * scale
 
 
 def send_nav_goal(x, y, label):
@@ -139,8 +162,12 @@ def main():
             alert = find_next_alert(handled_timestamps)
 
             if alert:
-                x, y = alert["coords"]
+                raw_x, raw_y = alert["coords"]
+                x, y = apply_goal_standoff(raw_x, raw_y)
                 label = f"ALERT: {alert.get('reason')} in {alert.get('zone')}"
+                if (x, y) != (raw_x, raw_y):
+                    print(f"[dispatch_bridge] pulling goal in from wall: "
+                          f"({raw_x}, {raw_y}) -> ({x:.2f}, {y:.2f})")
                 send_nav_goal(x, y, label)
                 # Mark handled regardless of success/failure/timeout - we
                 # don't want to get stuck retrying an unreachable point
