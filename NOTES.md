@@ -666,6 +666,30 @@ horizontal/vertical aperture to match its resolution's aspect ratio at
 creation time, instead of letting Isaac Sim silently auto-correct (and log
 about) it on every access.
 
+## FOUND: the log-noise "fix" actually broke everything worse
+
+The run right after the previous fix regressed hard - full PoseTree spam
+AND "sequence size exceeds remaining buffer" both came back in force,
+plus a new error block at startup:
+`[Error] [carb.dictionary.plugin] getStringRawInternal: item isaacsim.ros2.nodes is not a string`
+(repeated once per channel name). Root cause: Kit's real schema for
+`/log/channels/<name>` is a PLAIN STRING (the level itself, e.g.
+`"Error"`), not a nested object. Setting `/log/channels/<name>/level` and
+`/log/channels/<name>/enabled` created a dict at that path instead,
+corrupting the exact structure Kit's own startup code reads as a string
+when it registers channels - breaking log-channel registration outright
+and cascading into everything reappearing (and possibly contributing to
+the renderer settings not landing correctly either, though those were
+separate constructor-dict keys and less directly implicated).
+
+**Fix:** switched to the correct flat schema -
+`carb.settings.get_settings().set(f"/log/channels/{channel}", "Error")`,
+one plain string per channel, no sub-keys. Also removed the
+`omni.log.set_channel_enabled()` attempt entirely (unverified API guess,
+not worth stacking another untested mechanism on top of a now-correct one).
+
+**Not yet re-tested.**
+
 ## FOUND: real root cause - blocking subprocess calls starved physics stepping
 
 After the RigidPrim fix, position tracking was confirmed accurate (debug

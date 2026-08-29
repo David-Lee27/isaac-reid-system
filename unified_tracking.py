@@ -163,27 +163,22 @@ simulation_app = SimulationApp({
 })
 
 import carb
-# Per-channel log suppression still needs to happen via Python calls (no
-# launch-config equivalent for arbitrary channel names), but now runs
-# immediately after SimulationApp() instead of after enabling the ROS2
-# bridge extension, so it's in place before that extension's nodes start
-# ticking and logging.
+# Per-channel log suppression via flat "/log/channels/<name>" = "<level>"
+# string entries - this IS Kit's real schema (confirmed by the previous
+# attempt's error: setting "/level"/"/enabled" sub-keys under each channel
+# turned that entry into a nested dict, and Kit's own startup code, which
+# expects to read each channel entry as a plain string, errored on every
+# single one - "getStringRawInternal: item <channel> is not a string" -
+# which broke far more than it fixed). No sub-keys this time.
 for _channel in ("isaacsim.ros2.nodes", "isaacsim.ros2.bridge", "isaacsim.ros2.core",
                   "omni.hydra", "rtx.hydra", "omni.syntheticdata.plugin",
                   "isaacsim.sensors.camera.camera", "rtx.scenedb.plugin",
                   "isaacsim.ros2.core.impl.camera_info_utils", "omni.timeline.plugin",
                   "carb"):
     try:
-        carb.settings.get_settings().set(f"/log/channels/{_channel}/level", "Error")
-        carb.settings.get_settings().set(f"/log/channels/{_channel}/enabled", False)
+        carb.settings.get_settings().set(f"/log/channels/{_channel}", "Error")
     except Exception:
         pass
-try:
-    import omni.log
-    for _channel in ("isaacsim.ros2.nodes", "omni.hydra", "rtx.hydra"):
-        omni.log.set_channel_enabled(_channel, False, omni.log.SettingBehavior.OVERRIDE)
-except Exception:
-    pass
 
 # Explicitly enable the ROS2 bridge extension - toggling it on manually in
 # the GUI only applies to that running session and does NOT carry over to a
