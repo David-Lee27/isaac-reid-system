@@ -514,6 +514,40 @@ they were unaffected in practice since they use explicit translate ops.
 
 **Not yet re-tested.**
 
+## CONFIRMED WORKING: clean run, log-channel schema fix resolved everything
+
+Re-ran after the flat-string channel fix - confirmed clean: no
+`getStringRawInternal` errors, no PoseTree spam, no buffer-overrun spam.
+Only minor one-time-per-camera notices remain (`camera_info_utils`
+aperture-forcing messages), not loops - not worth further chasing.
+
+**Step 1 (real Nav2-driven navigation replacing kinematic teleport) is now
+considered DONE.** Full session summary of what's actually working:
+- Real physics-driven robot movement (kinematic off), no more teleport
+- `dispatch_bridge.py` (WSL) drives both patrol and dispatch via real
+  Nav2 `NavigateToPose` goals, with goal-standoff so it never targets a
+  point on top of a wall
+- Odometry, costmap obstacle sources (real lidar topics, not the
+  nonexistent stock `/scan`), `use_sim_time`, and physics-starvation
+  (Popen-polling instead of blocking subprocess calls) are all fixed
+- Log output is clean, render settings lightened, no more freezing
+
+**Known remaining rough edges (not blocking, documented for later):**
+- `[PoseTree] eInvalid` root cause never actually fixed (only suppressed at
+  the log level) - `repair_broken_tf_publisher_targets()` consistently
+  finds 0 repairable relationships, meaning the broken references aren't
+  stored as plain USD relationships the way it checks for. Not investigated
+  further since it turned out to be unrelated to both the wall-collision
+  (that was goal placement) and the physics-starvation issues (that was
+  blocking subprocess calls) - it may be entirely cosmetic.
+- `camera_front` sibling mesh doesn't visually follow the robot (known,
+  cosmetic, doesn't affect the real nested camera used for detection).
+
+**Next steps (from the original step 1 follow-up list):**
+1. Benchmark re-ID metrics (accuracy/latency) for portfolio documentation.
+2. Record demo video.
+3. Polish GitHub repo + README.
+
 ## FOUND (confirmed): robot drove into a pillar - costmap was never getting real lidar data
 
 User reported the robot physically drove into a wall/pillar, and goals kept
