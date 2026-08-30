@@ -548,6 +548,71 @@ considered DONE.** Full session summary of what's actually working:
 2. Record demo video.
 3. Polish GitHub repo + README.
 
+## Character animation research + implementation (fall + walk-facing)
+
+User correctly called out that people never fall over and never move
+realistically (sliding sideways, no animation), and that the robot's scan
+doesn't reflect real scenarios. Investigated properly before writing code -
+ran a read-only diagnostic (`diagnose_characters.py`) against the actual
+character USD prims instead of guessing.
+
+**Findings:** all three People characters (from NVIDIA's official Isaac Sim
+6.0 People asset pack, loaded from
+`.../Isaac/6.0/Isaac/People/Characters/.../*.usd`) have a real, correctly-
+rigged 101-joint UsdSkel skeleton, but ZERO animation bound
+(`animationSource targets: []`, no SkelAnimation prims anywhere). Not
+broken - just never had a walk clip attached.
+
+Researched whether to attach NVIDIA's real walk-cycle clips (from the
+sibling `.../Isaac/People/Animations/` folder). Found multiple independent,
+version-spanning (4.1 through 5.1) reports of this exact approach being
+broken specifically when driven via standalone Python scripts (not the
+interactive GUI): payloads resetting to origin, characters stuck in T-pose,
+someone hitting our exact scenario ("has not worked... not able to get the
+animations to work when manually placing the models and animations").
+NVIDIA's own extension for this (`omni.anim.people`) is being deprecated in
+favor of a heavier synthetic-data-generation-oriented system
+(`isaacsim.replicator.agent`) that multiple users describe as "overkill"/
+"confusing" for simple walking. Given this, attempting real skeletal
+animation binding tonight was judged too high-risk for the time available -
+documented as a known future improvement rather than attempted blind.
+
+**Implemented instead (both real, working, verified-in-code changes):**
+
+1. **Scripted fall event** (`FALL_ENABLED`/`FALL_START_RANGE` in
+   `unified_tracking.py`): one random person, at a random time (15-55s into
+   the run), physically collapses - rotated 90 degrees about a random
+   horizontal axis via a new `set_rotation()` helper, frozen in place for
+   `FALL_PAUSE_DURATION` (45s), then automatically stands back up (rotation
+   reset to identity). This is a REAL event now, not just a heuristic that
+   occasionally misfires - `check_for_fall()`'s aspect-ratio detection
+   (unchanged) now has something genuine to actually detect when a camera
+   happens to see the collapsed character, closing the loop the user asked
+   for ("so the scan can scan real scenarios").
+
+2. **Face-direction-of-travel + step bob** (in the patrol movement block of
+   `update_person_position()`): characters now rotate to face their actual
+   direction of travel each leg (NVIDIA People characters use -Y as forward
+   per NVIDIA's docs, so yaw = atan2(dx, -dy)) instead of sliding sideways/
+   backwards, plus a small sine-wave vertical bob synced to a walk-cadence
+   frequency for a bit of visual life. NOT a real walk cycle - documented
+   plainly as a stopgap, not a finished feature - but a real, guaranteed-to-
+   work improvement over pure unoriented sliding.
+
+**Not yet re-tested - next step is running a full session and confirming
+(a) the fall looks right and gets detected by a real camera sweep, (b) the
+facing direction is correct (NVIDIA's -Y-forward convention was applied
+from their docs, not verified live - may need a 90/180-degree correction
+if it looks off), and (c) nothing about the new rotate ops conflicts with
+the existing translate-based movement/pause/loiter logic.**
+
+**Still open, explicitly deferred (not silently dropped):**
+- Real skeletal walk-cycle animation (documented above as high-risk/
+  version-fragile even for NVIDIA's own recommended workflow)
+- Robot's on-arrival scan is still a single static snapshot with no active
+  face-search/aiming behavior (see earlier conversation - separate task,
+  not started yet)
+
 ## FOUND (confirmed): robot drove into a pillar - costmap was never getting real lidar data
 
 User reported the robot physically drove into a wall/pillar, and goals kept

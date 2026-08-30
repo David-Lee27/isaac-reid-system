@@ -48,11 +48,19 @@ SECONDS_PER_LEG = 4
 LOOP_PATROL = True
 
 # When a fall is detected, the nearest patrol character to that zone gets
-# frozen in place for this long - simple placeholder so the robot has
-# someone to actually find on arrival, rather than the "fallen" person
-# just continuing to walk their patrol loop. Real fallen-pose animation is
-# a separate later task.
+# frozen in place for this long - used both by the camera-detection-side
+# freeze (pause_nearest_mover, a heuristic proxy) and as the lie-down
+# duration for the new SCRIPTED fall event below.
 FALL_PAUSE_DURATION = 45  # seconds
+
+# --- Randomized scripted fall event ---
+# One random person actually, physically collapses at a random time during
+# the run (rotated to lie on the ground, then frozen) - a REAL event for the
+# camera's aspect-ratio fall heuristic to detect, instead of that heuristic
+# only ever firing on incidental noise from a person who's still standing.
+FALL_ENABLED = True
+FALL_START_RANGE = (15, 55)       # seconds into the run it can happen
+FALL_ROTATION_OPTIONS = [(90, 0, 0), (-90, 0, 0), (0, 90, 0), (0, -90, 0)]  # random fall direction, degrees
 
 # --- Randomized loitering test ---
 # One random person gets assigned a random window during the run where,
@@ -306,6 +314,21 @@ def set_translate(prim, pos):
     xform.AddTranslateOp().Set(Gf.Vec3d(*pos))
 
 
+def set_rotation(prim, degrees_xyz):
+    """Sets (or creates) a rotateXYZ xformOp on this prim, in degrees.
+    Used to physically collapse a character for the scripted fall event -
+    rotating the whole standing character 90 degrees about a horizontal
+    axis makes their bounding box genuinely go wide/short (matching what
+    check_for_fall()'s aspect-ratio heuristic is actually looking for),
+    instead of that heuristic only ever firing on incidental noise."""
+    xform = UsdGeom.Xformable(prim)
+    for op in xform.GetOrderedXformOps():
+        if op.GetOpType() == UsdGeom.XformOp.TypeRotateXYZ:
+            op.Set(Gf.Vec3f(*degrees_xyz))
+            return
+    xform.AddRotateXYZOp().Set(Gf.Vec3f(*degrees_xyz))
+
+
 def disable_physics_recursive(prim):
     if prim.HasAPI(UsdPhysics.RigidBodyAPI):
         rigid_api = UsdPhysics.RigidBodyAPI(prim)
@@ -319,8 +342,28 @@ def disable_physics_recursive(prim):
 
 
 def update_person_position(mover, elapsed):
-    # Frozen in place from a recent fall detection - skip all movement,
-    # patrol and loiter alike, until the pause expires.
+    # Stand back up once a scripted fall's lie-down duration has elapsed -
+    # reset rotation to upright before resuming normal movement below.
+    if mover.get("fallen") and elapsed >= mover.get("paused_until", 0):
+        set_rotation(mover["prim"], (0, 0, 0))
+        mover["fallen"] = False
+
+    # Trigger this mover's scripted fall once, at their assigned time - a
+    # REAL physical collapse at wherever they currently are (patrol or
+    # loiter), not a heuristic guess. Fires once via fall_triggered.
+    fall_start = mover.get("fall_start")
+    if (fall_start is not None and not mover.get("fall_triggered")
+            and elapsed >= fall_start):
+        mover["fall_triggered"] = True
+        mover["fallen"] = True
+        mover["paused_until"] = elapsed + FALL_PAUSE_DURATION
+        axis = random.choice(FALL_ROTATION_OPTIONS)
+        set_rotation(mover["prim"], axis)
+        print(f"*** {mover['name']} has fallen (scripted event) - lying down for {FALL_PAUSE_DURATION}s ***")
+
+    # Frozen in place (scripted fall above, or a camera-detection-triggered
+    # pause via pause_nearest_mover) - skip all movement, patrol and loiter
+    # alike, until the pause expires.
     if elapsed < mover.get("paused_until", 0):
         return
 
@@ -361,6 +404,23 @@ def update_person_position(mover, elapsed):
         p1[1] + (p2[1] - p1[1]) * leg_t,
         p1[2] + (p2[2] - p1[2]) * leg_t,
     )
+
+    # Face the direction of travel instead of sliding sideways/backwards -
+    # these NVIDIA People characters use -Y as their forward axis (per
+    # NVIDIA's own asset docs), so a Z rotation of atan2(dx, -dy) points
+    # that forward axis at the direction of travel. Add a small vertical
+    # step-bob synced to a walk-cadence-ish frequency for a bit of life -
+    # not a real walk cycle (that requires baked animation clips these
+    # assets don't have bound - see NOTES.md), but a real, guaranteed-to-
+    # work improvement over pure sliding.
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    if dx != 0 or dy != 0:
+        yaw_deg = math.degrees(math.atan2(dx, -dy))
+        set_rotation(mover["prim"], (0, 0, yaw_deg))
+    bob = 0.04 * abs(math.sin(elapsed * 6.0))
+    new_pos = (new_pos[0], new_pos[1], new_pos[2] + bob)
+
     set_translate(mover["prim"], new_pos)
 
 
@@ -951,7 +1011,7 @@ def main():
         movers.append({
             "name": name, "prim": prim, "path": full_path, "start_delay": info["start_delay"],
             "loiter_start": None, "loiter_duration": None, "loiter_center": None,
-            "paused_until": 0
+            "paused_until": 0, "fall_start": None, "fall_triggered": False, "fallen": False,
         })
 
     # --- Robot setup ---
@@ -1006,6 +1066,11 @@ def main():
         loiterer["loiter_center"] = random.choice(list(ZONE_CENTERS.values()))
         print(f"*** {loiterer['name']} will loiter near {loiterer['loiter_center']} "
               f"starting at t={loiterer['loiter_start']:.1f}s for {loiterer['loiter_duration']:.1f}s ***")
+
+    if FALL_ENABLED and movers:
+        faller = random.choice(movers)
+        faller["fall_start"] = random.uniform(*FALL_START_RANGE)
+        print(f"*** {faller['name']} will fall (scripted) at t={faller['fall_start']:.1f}s ***")
 
     print("=== Unified tracking + movement loop started. Press Ctrl+C to stop. ===")
 
