@@ -613,6 +613,121 @@ the existing translate-based movement/pause/loiter logic.**
   face-search/aiming behavior (see earlier conversation - separate task,
   not started yet)
 
+## BREAKTHROUGH: found the real animation filename - session ended here, resume next time
+
+Session hit its limit right after a major find, documenting clearly so the
+next session can pick up immediately with no re-investigation needed.
+
+**Diagnostic method fix:** `Sdf.Layer.FindOrOpen()` (used in early versions
+of `test_animation.py`) was CONFIRMED UNRELIABLE for checking whether a
+remote HTTP asset path exists - it returned False for every single guess,
+including paths later confirmed real. Replaced with `omni.client.list()`/
+`omni.client.stat()` (new script: `list_people_assets.py`), which is the
+real, correct API for listing/checking Nucleus/HTTP asset server contents.
+Always use `omni.client`, not `Sdf.Layer.FindOrOpen()`, for this kind of
+check going forward.
+
+**The real animation file, confirmed via actual directory listing:**
+```
+https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/6.0/Isaac/People/Animations/stand_walk_loop.skelanim.usd
+```
+A proper looping walk-cycle clip. Other useful ones in that same folder:
+`stand_idle_loop.skelanim.usd`, `stand_walk_1.skelanim.usd` through `_7`
+(non-looping variants + `_mirror` versions), `Sit.skelanim.usd`,
+`stand_idle_wave_loop.skelanim.usd`.
+
+`test_animation.py` has been updated to use this confirmed real filename
+(was previously guessing wrong names and always failing at that step) and
+to use the fixed `omni.client.stat()`-based resolve check. **This has NOT
+been run yet with the real filename - that's the very next step.**
+
+**Exact next steps for next session, in order:**
+1. Run `test_animation.py` (already updated with the real filename) -
+   fully isolated, touches nothing in the real project. Its final output
+   ("Joints with different transforms between t0 and t1: N / 101") tells
+   us definitively whether real skeletal animation actually plays in this
+   standalone-script Isaac Sim environment (the `omni.anim.graph.core`
+   extension-enable fix from the NVIDIA forums is already applied in this
+   script, attempting to work around the documented standalone-app T-pose
+   bug).
+2. If SUCCESS (joints genuinely animate): port the same reference+bind
+   approach into a one-time setup script that modifies the REAL
+   `warehouse_v1.usd` (on a saved copy first, e.g.
+   `warehouse_v1_animated.usd`, never overwrite the working file directly
+   until fully verified) - reference `stand_walk_loop.skelanim.usd` onto
+   each of the three People characters' skeletons, verify visually, then
+   point `USD_STAGE_PATH` in `unified_tracking.py` at the new file.
+3. If FAILED (joints still static): the `omni.anim.graph.core` fix wasn't
+   enough on its own. Fall back cleanly to the current stopgap (face-
+   direction-of-travel + step bob, already implemented and working) and
+   consider this explicitly closed rather than reopening again - we will
+   have then tried the two most promising approaches (manual bind + the
+   documented extension fix) and both would have failed, meaning IRA
+   (`isaacsim.replicator.agent`) or a from-scratch procedural joint-driver
+   would be the remaining options, both substantial standalone efforts.
+
+**Also confirmed the character folder listing** - if different/additional
+character variety is ever wanted (user mentioned current three are just
+placeholders, open to swapping), real available character folders include:
+`F_Business_02`, `F_Medical_01`, `M_Medical_01`,
+`female_adult_police_01_new`, `female_adult_police_02`,
+`female_adult_police_03_new`, `male_adult_construction_01_new`,
+`male_adult_construction_03`, `male_adult_construction_05_new`,
+`male_adult_police_04`, plus several `original_*` variants of each.
+
+## CONCLUSIVE FINDING: characters are Reallusion-rigged, incompatible with NVIDIA's own animation clips
+
+Ran the isolated test with the real animation filename
+(`stand_walk_loop.skelanim.usd`) found via `list_people_assets.py`.
+
+**Attempt 1 (with omni.anim.graph.core etc. force-enabled):** FAILED with a
+hard error - `Buffer size mismatch: translations=81, rotations=81,
+expected jointCount=101` from `omni.anim.skelJoint.plugin`.
+
+**Attempt 2 (skipped those NVIDIA extensions, plain UsdSkel only):** no
+crash, but still 0/101 joints animating.
+
+**Root cause, found via direct joint-name comparison (added to
+`test_animation.py`):** ZERO name overlap between the skeleton and the
+animation clip. The character skeleton uses `RL_BoneRoot/Hip/Pelvis/
+L_Thigh/...` naming - the unmistakable signature of a **Reallusion
+Character Creator** rig. The animation clip uses `Root/Pelvis/R_UpLeg/
+R_LoLeg/...` - NVIDIA's own generic biped naming. These are two
+completely incompatible skeleton conventions. Confirmed this isn't a
+fluke of one character - tested a second character
+(`male_adult_construction_01`) and got the identical `RL_BoneRoot` naming
+and identical zero overlap. **Every character in the People/Characters
+folder is Reallusion-rigged and will never directly bind to NVIDIA's own
+Animations folder clips - this is a hard, structural incompatibility, not
+a bug to fix.**
+
+**Investigated DH_Characters ("Digital Human") as an alternative** -
+these turned out to be NVIDIA's high-fidelity MetaHuman-quality digital
+human assets. Loading even ONE of these took over 20 minutes (stuck
+compiling MDL shader materials) before being killed - far too heavyweight
+for a real-time multi-character patrol sim regardless of rig
+compatibility. Ruled out on performance grounds alone, in addition to
+rig-compatibility being unconfirmed.
+
+**Decision for next session:** stop trying to use Isaac Sim's own bundled
+animation assets - they don't match this character rig family. Instead,
+since the characters are confirmed Reallusion-rigged, use an EXTERNAL
+source built specifically to retarget animation onto arbitrary humanoid
+rigs (including Reallusion ones) - this is a proven, well-trodden workflow
+used by millions, not another blind compatibility guess:
+- **Adobe Mixamo** (free, huge animation library, auto-retargets to
+  arbitrary humanoid skeletons including Reallusion rigs) - most promising
+  first try.
+- **Reallusion's own ActorCore/AccuRIG ecosystem** (since the character IS
+  a Reallusion asset, their own animation pipeline is natively compatible).
+
+User confirmed they're fine with pulling animation from outside Isaac
+Sim's own asset library and doing manual setup work if needed, as long as
+it's something that will DEFINITELY work rather than another experiment.
+Current stopgap (face-direction-of-travel + step bob in
+`update_person_position()`) remains in place and working in the meantime -
+not reverted, still the active behavior until real animation lands.
+
 ## FOUND (confirmed): robot drove into a pillar - costmap was never getting real lidar data
 
 User reported the robot physically drove into a wall/pillar, and goals kept
@@ -895,3 +1010,137 @@ and distance, so if this still doesn't work we can see the actual numbers
 instead of guessing blind again.
 
 **Not yet re-tested.**
+
+## FOUND (high confidence, not yet re-tested): real root cause of "robot only moves 0.1 m/s" - idle cameras never stop rendering
+
+Confirmed both `nav2_params.yaml` (`FollowPath.vx_max: 10.0`) and the
+differential_controller OmniGraph node (`fix_differential_controller_speed.py`,
+all maxLinearSpeed/maxAngularSpeed/etc already at generous values) were
+already maxed out from earlier sessions - raising either further would do
+nothing, consistent with every previous "bump the speed config" attempt
+having zero real-world effect.
+
+The actual bottleneck, per `unified_tracking.py`'s own `[PERF]` updates/sec
+instrumentation (already in place from the wall-clock-vs-sim-clock
+investigation): real simulated time per real second is collapsing. Root
+cause - `capture_frame()`'s `_camera_cache` keeps every `Camera` object
+it ever creates alive and rendering for the rest of the run. This scene
+has 7 total cameras (5 zone cams + checkpoint + robot cam), so by partway
+through any run all 7 are simultaneously rendering their own full render
+product on EVERY `simulation_app.update()` call - including the ~90%+ of
+wall-clock time between 8-second sweeps when nothing is even being
+captured and the robot/people should be moving at full commanded speed.
+This matches the previously-logged "GPU render cost per camera capture
+(6+ simultaneous render products)" note exactly, except it turns out not
+to be a fixed hardware ceiling - it's 6 idle cameras rendering for no
+reason, which is fixable in software.
+
+**Fix:** `capture_frame()` now calls `camera.resume()` right before
+waiting for a frame and `camera.pause()` right after (both real public
+`isaacsim.sensors.camera.Camera` methods), so only the ONE camera
+actively being captured is ever rendering at a time - every other cached
+camera sits paused between uses instead of costing a full render every
+tick. Wrapped in try/except (flips a module-level flag and falls back to
+always-on cameras with a `[WARN]` print if `.pause()`/`.resume()` aren't
+supported on this Isaac Sim build) so a version mismatch fails safe
+instead of breaking capture.
+
+**Not yet re-tested - this is the real test to watch for:** run
+`unified_tracking.py` and check the `[PERF] N sim updates in 5.0s real
+time = X updates/sec` lines. If this fix is right, updates/sec should
+climb noticeably once the first sweep finishes and cameras start
+pausing between uses (compare against a baseline run without this change
+if you want a clean before/after number), and the robot's real-world
+m/s should track much closer to what Nav2/the differential_controller are
+actually commanding instead of sitting at ~0.1 m/s regardless of config.
+
+## TESTED, PARTIALLY WRONG: camera pause/resume didn't move the needle - real ceiling is elsewhere
+
+Ran with the camera pause/resume fix above. Result: `[PERF]` showed
+~12 updates/sec BEFORE the first sweep even started - i.e. with
+`_camera_cache` still completely empty, zero cameras created yet. That
+proves the camera-pause hypothesis wrong as the explanation for the
+baseline ceiling (it may still help marginally once multiple cameras are
+actually active mid-sweep, left in place, but it isn't THE bottleneck).
+Also, `sequence size exceeds remaining buffer` spam came back in heavy,
+constant volume from the very start of the run.
+
+**Two real findings from this run:**
+
+1. **`run_sim_filtered.bat` was never actually being used** (user was
+   invoking `python.bat` directly) - moved to
+   `_unused_run_sim_filtered.bat.txt` at the user's request rather than
+   left around to cause confusion again. Per the user, this script was
+   dropped earlier because in practice it appeared to filter out
+   everything, not just the buffer-spam lines - not re-investigated further
+   since the user doesn't want to rely on output-filtering as the fix
+   anyway.
+2. Bumped `/rtx/scenedb/maxHistoryTransformCount` 512 -> 2048 as a
+   belt-and-suspenders change, but this is a secondary cleanup, not
+   expected to be the real speed fix on its own.
+
+**Not yet re-tested with the buffer bump alone** - superseded by the
+larger fix below before a dedicated test of just this change was run.
+
+## REAL FIX (high confidence, not yet tested): physics/render decoupling via SimulationContext
+
+The actual explanation for a flat ~12 updates/sec ceiling that exists even
+with zero cameras active: `simulation_app.update()` couples a full Hydra
+render to EVERY single tick, with no way to separate them. Rendering, not
+physics or ROS2 message passing, is the expensive part - so every tick,
+including the vast majority that are just "step physics, check robot
+arrival, let ROS2/Nav2 do their thing," was paying full render cost for no
+reason.
+
+**Fix:** switched `_tick()` from raw `simulation_app.update()` to
+`isaacsim.core.api.SimulationContext.step(render=...)` (the standard,
+documented Isaac Sim pattern for headless/bulk-physics speed - physics and
+OmniGraph, including the ROS2 bridge nodes that drive /odom, /tf, and
+/cmd_vel consumption, still execute on every single tick; only the actual
+Hydra render pass is now conditional). A new `RENDER_EVERY_N_TICKS = 6`
+throttle means only 1 in 6 ticks renders by default, EXCEPT inside
+`capture_frame()`'s frame-wait loop, which now calls `_tick(force_render=True)`
+since that loop genuinely needs a real image back every time. Every other
+`_tick()` call site (movement, robot arrival checks, subprocess-wait polling,
+face-search yaw waits) doesn't need a picture, just a physics step, so it
+falls through to the throttle.
+
+Wrapped in the same fail-safe pattern as everything else in this file:
+`SimulationContext.instance()`/`SimulationContext()` acquisition and every
+`.step(render=...)` call are in try/except blocks that flip
+`_render_decouple_supported = False` and fall back to plain
+`simulation_app.update()` on any failure, so a version mismatch on this
+Isaac Sim build degrades to the old (slow but working) behavior instead of
+breaking physics/ROS2/movement.
+
+Also upgraded the `[PERF]` line itself to report both total sim steps/sec
+AND rendered frames/sec separately, so it's directly visible whether the
+decoupling is doing anything (e.g. "60 sim steps (10 rendered) in 5.0s =
+12.0 steps/sec, 2.0 rendered/sec" would mean physics is running 6x faster
+than the old render-locked rate while only rendering the same 1-in-6
+fraction).
+
+**Not yet re-tested - this is the real test:** run `unified_tracking.py`
+(directly with `python.bat`, NOT the removed filtered wrapper) and watch
+for:
+- A `[WARN] Could not acquire SimulationContext` or
+  `[WARN] SimulationContext.step(render=) failed` line - if either
+  appears, this build's API doesn't support the exact call used here and
+  the whole thing silently fell back to the old behavior (no crash, no
+  speed gain either).
+- If neither WARN appears: the `[PERF] ... steps/sec, ... rendered/sec`
+  line should show steps/sec meaningfully higher than rendered/sec (close
+  to 6x apart, matching RENDER_EVERY_N_TICKS), and real-world robot m/s
+  should finally track much closer to what Nav2/the differential_controller
+  are actually commanding.
+- Watch Nav2's own logs for anything about missed control-loop rate or TF
+  lookup failures - if physics is now advancing much faster in wall-clock
+  terms than before, double-check `use_sim_time` timing still lines up
+  correctly (it should, since Isaac's `/clock` publish rate is tied to
+  physics steps, which are now happening MORE often per real second, not
+  less - but worth watching for on the first run regardless).
+- If TF/ROS2 topics look sparse or Nav2 behaves worse, try lowering
+  `RENDER_EVERY_N_TICKS` (e.g. to 3) rather than reverting outright - some
+  ROS2 publishers in Isaac Sim's bridge may be tied to render events rather
+  than pure physics steps, which would mean this needs tuning rather than
+  a full revert.

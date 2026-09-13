@@ -10,8 +10,18 @@ Run from PowerShell:
     C:\isaacsim\python.bat C:\isaacsim\projects\surveillance-proj\unified_tracking.py
 """
 
-USD_STAGE_PATH = r"C:\Users\popli\isaacsim\scenes\warehouse_v1.usd"
-HEADLESS = False
+USD_STAGE_PATH = r"C:\Users\popli\isaacsim\scenes\optimized room.usd"  # real filename has a SPACE, not an underscore - confirmed from the Isaac Sim title bar
+HEADLESS = False  # you asked to watch it - render/physics decoupling and the muted spam filter both still apply, this just also opens the actual viewport window instead of running invisibly.
+# "RTX - Minimal" (visible in the viewport's render-mode dropdown) is the
+# actual lightweight RTX preset for this Isaac Sim build - NOT a separate
+# "Storm" renderer (that's not even an option in this build's menu; an
+# earlier attempt to pass "renderer": "Storm" here was wrong and got
+# silently ignored). This just makes explicit, at every launch, the same
+# preset your screenshot showed already selected by default - real-time
+# RTX with reflections/AO/GI/path-tracing off (matches the settings
+# already disabled below), instead of relying on incidental default
+# behavior that could change between Isaac Sim versions/machines.
+USE_MINIMAL_RENDERER = True
 PROJECT_DIR = r"C:\isaacsim\projects\surveillance-proj"
 KNOWN_FACES_DIR = PROJECT_DIR + r"\known_faces"
 ID_COUNTER_FILE = PROJECT_DIR + r"\next_id.txt"
@@ -24,16 +34,32 @@ APPEARANCE_MATCH_THRESHOLD = 0.7   # HSV histogram correlation, 0-1, higher = st
 
 CHECKPOINT_NAME = "EntryCamera"
 CHECKPOINT_PATH = "/World/EntryCamera"
+# The new optimized room.usd scene has NO checkpoint/entry camera at all
+# (confirmed via diagnose_new_scene_cameras.py - only Camera1-4 exist).
+# Calling capture_frame() on a camera prim that doesn't exist would throw
+# and crash the whole run the first time a sweep tried to scan it, not
+# fail gracefully. CHECKPOINT_AVAILABLE is set for real in main() once the
+# stage is loaded (by actually checking whether the prim exists), and
+# run_sweep skips the checkpoint scan entirely when it's False. Identity
+# checking now happens only via the robot's own orbit search on arrival -
+# consistent with the current direction (zone cameras are fall/loitering
+# detection only, the robot does the actual person-level investigation).
+CHECKPOINT_AVAILABLE = False
 
 SCAN_INTERVAL_SECONDS = 8   # how often to run a full camera sweep
 LOITER_THRESHOLD = 3        # consecutive same-zone sightings to flag loitering
 
 # --- People + patrol path ---
 PEOPLE = {
-    "Person1": {"prim_path": "/World/male_adult_police_04",          "start_delay": 0},
-    "Person2": {"prim_path": "/World/male_adult_construction_03",     "start_delay": 5},
-    "Person3": {"prim_path": "/World/male_adult_construction_01_new", "start_delay": 10},
+    "Person1": {"prim_path": "/World/xbot_person_1", "start_delay": 0},
+    "Person2": {"prim_path": "/World/xbot_person_2", "start_delay": 5},
+    "Person3": {"prim_path": "/World/xbot_person_3", "start_delay": 10},
 }
+
+# Everyone moves the same way now: idle until their assigned scripted
+# fall/loiter event (see update_person_position) - the old ACTIVE_MOVER_COUNT
+# concept (some people patrol, others frozen at spawn) doesn't apply anymore
+# since NOBODY continuously patrols.
 
 WAYPOINTS = [
     (27.46, 16.33, 0),
@@ -44,7 +70,7 @@ WAYPOINTS = [
     (26.03, 12.98, 0),
     (29.9, 13.4, 0),
 ]
-SECONDS_PER_LEG = 4
+SECONDS_PER_LEG = 8  # halved patrol speed (was 4) per request
 LOOP_PATROL = True
 
 # When a fall is detected, the nearest patrol character to that zone gets
@@ -71,12 +97,15 @@ LOITER_START_RANGE = (20, 50)      # seconds into the run it can begin
 LOITER_DURATION_RANGE = (25, 40)   # how long they wander before resuming patrol
 LOITER_RADIUS = 2.0                # meters, how far they wander from the center point
 
-# Zone camera positions, reused as loiter centers (from earlier camera placement)
+# Zone camera positions, reused as loiter/fall centers - real coordinates
+# from optimized room.usd (see diagnose_new_scene_cameras.py output), NOT
+# guessed. Room A = Camera1/Camera2 (the room with the people, per direct
+# observation of the scene), Room B = Camera3/Camera4.
 ZONE_CENTERS = {
-    "Zone_A_NorthEast": (28.67, 28.73),
-    "Zone_B_SouthEast": (28.97, -7.97),
-    "Zone_C_SouthWest": (-28.71, -9.28),
-    "Zone_D_NorthWest": (-28.7, 28.73),
+    "RoomA_Cam1": (22.60, 27.36),
+    "RoomA_Cam2": (39.21, 9.00),
+    "RoomB_Cam3": (21.64, 8.91),
+    "RoomB_Cam4": (5.83, 27.40),
 }
 
 # --- Robot dispatch ---
@@ -101,18 +130,43 @@ ROBOT_CHECK_INTERVAL = 3.0    # seconds between checking for new dispatch alerts
 # (b) watch the robot's REAL position (driven by physics, not by us) to
 # detect arrival at a dispatch location and trigger the on-arrival scan.
 PATROL_WAYPOINTS_FILE = PROJECT_DIR + r"\robot_patrol_waypoints.json"
-ARRIVAL_RADIUS = 2.0          # meters - how close counts as "arrived" for triggering a scan
+ARRIVAL_RADIUS = 3.0          # meters - bumped from 2.0: with continuous live tracking (see update_robot) this is now a real "stop a comfortable distance in front of them" radius, not just a tolerance for a static point
 
-# Robot gets its own patrol loop, pulled in from the walls compared to the
-# people's path - it's a bigger vehicle and (being kinematic) doesn't get
-# physically stopped by collisions, it'll just visually clip through walls
-# if driven too close to them.
-ROBOT_WAYPOINTS = [
-    (20, 20, 0),
-    (20, 0, 0),
-    (-20, 0, 0),
-    (-20, 20, 0),
-]
+# --- Active face search on arrival (replaces the old single-static-
+# snapshot scan) ---
+# On arrival, the robot no longer just takes one picture from whatever
+# direction it happened to stop facing. It sweeps through a series of
+# headings AT THE SAME LOCATION (via small yaw-only Nav2 sub-goals - see
+# dispatch_bridge.py's FACE_SEARCH_GOAL_FILE handling), running a full
+# YOLO -> crop -> DeepFace attempt at each heading, and stops as soon as
+# one attempt gets a usable face. This is what makes the robot actually
+# "look for" the person instead of hoping they're in frame by luck.
+FACE_SEARCH_GOAL_FILE = PROJECT_DIR + r"\robot_face_search_goal.json"
+FACE_SEARCH_YAW_STEPS = 8              # full circle in 45-degree increments
+FACE_SEARCH_YAW_TOLERANCE_DEG = 8.0    # how close to the target heading counts as "turned"
+FACE_SEARCH_YAW_WAIT_TIMEOUT = 20.0    # seconds to wait for a single turn before giving up on it
+
+# Robot patrols the 4 real zone-camera positions in this scene (reusing
+# ZONE_CENTERS - no reason to invent separate patrol points when the
+# actual points of interest ARE the camera zones).
+ROBOT_WAYPOINTS = [(x, y, 0) for x, y in ZONE_CENTERS.values()]
+
+# --- SIMPLIFIED KINEMATIC ROBOT MOVEMENT (replaces real Nav2/PhysX driving) ---
+# Real wheel physics through Nav2 turned out not to be worth the cost for
+# this project's actual goal: the robot reliably reaching alert locations
+# so its camera can run a face search, not accurate differential-drive
+# kinematics. Diagnosed (not guessed) that the wheel geometry itself was
+# fine (measured wheelDistance matched the authored 0.34m exactly) - the
+# real problem was the whole Nav2/PhysX/ROS2 stack being fragile, slow to
+# debug, and sensitive to render-rate/render-event assumptions that kept
+# eating entire sessions. The robot now moves exactly like the patrol
+# people already do (see update_person_position) - direct kinematic
+# translation toward a target each tick, no physics, no wheels, no Nav2,
+# no WSL dependency for movement at all. Nav2/dispatch_bridge.py can still
+# run harmlessly alongside this (it's just not doing anything useful for
+# the robot anymore) or you can stop bothering with start_nav_stack.sh
+# entirely - movement no longer needs it.
+ROBOT_MOVE_SPEED = 3.0  # halved (was 6.0) per request
 
 # NOTE (known limitation, documented rather than solved - see NOTES.md):
 # wheel_left/wheel_right/camera_hand_link are SIBLINGS of base_footprint
@@ -126,21 +180,14 @@ ROBOT_WAYPOINTS = [
 # scan, since ROBOT_CAMERA_PATH is the properly-nested camera under
 # base_footprint/sensors/ and moves correctly with it automatically.
 
-# Isaac Sim's ROS2 bridge extension needs its OWN internal environment
-# variables set (pointing at its bundled ROS2 libraries) before it starts -
-# unrelated to the WSL/Jazzy discovery env vars set by set_ros_env.ps1. Must
-# be set BEFORE `from isaacsim import SimulationApp` - confirmed in
-# headless_slam_session.py.
+# Isaac Sim's ROS2 bridge extension used to be needed here for the old
+# Nav2/PhysX-driven robot. That path was fully abandoned in favor of pure
+# kinematic movement (see ROBOT_MOVE_SPEED's comment history) and the heavy
+# mobile_manipulator_ros asset itself was replaced with a lightweight
+# custom robot (see create_lightweight_robot) - ROS2 isn't driving
+# anything anymore, so enabling that whole extension was pure unnecessary
+# startup/runtime cost. Removed rather than left harmlessly enabled.
 import os
-os.environ["ROS_DISTRO"] = "humble"
-os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
-os.environ["PATH"] = os.environ["PATH"] + ";c:/isaacsim/exts/isaacsim.ros2.core/humble/lib"
-# Silence the ROS2 bridge's own logger (separate from the carb log-level
-# settings below - the "[PoseTree] ... getObjectType eInvalid" spam comes
-# from here, not carb, so it wasn't being caught by /log/level=Error).
-# These are non-fatal warnings from the known broken TF frames on this
-# robot asset (see NOTES.md) - harmless, just very noisy.
-os.environ["RCUTILS_LOGGING_SEVERITY_THRESHOLD"] = "ERROR"
 
 from isaacsim import SimulationApp
 
@@ -156,18 +203,33 @@ from isaacsim import SimulationApp
 # and is far more likely to actually take effect.
 simulation_app = SimulationApp({
     "headless": HEADLESS,
-    "width": 640,
+    # Dropped from 640x480 - this is the internal offscreen render surface
+    # size, paid on every rendered tick regardless of headless mode. You
+    # never see this buffer directly in headless mode, so there's no
+    # visual-quality reason to keep it large - only the actual camera
+    # capture resolutions (set separately per-camera in capture_frame()
+    # calls) matter for what YOLO/DeepFace actually see.
+    "width": 854,
     "height": 480,
     "/log/level": "Error",
     "/log/fileLogLevel": "Error",
     "/log/outputStreamLevel": "Error",
-    "/rtx/scenedb/maxHistoryTransformCount": 512,
+    "/rtx/scenedb/maxHistoryTransformCount": 2048,  # bumped from 512 - that value stopped the spam in an earlier session but it's back in force (see run this session, heavy "sequence size exceeds remaining buffer" volume even before any camera/sweep activity), so whatever's generating transform-history entries now needs more headroom than 512 gave it
     "/rtx/pathtracing/enabled": False,
     "/rtx/reflections/enabled": False,
     "/rtx/ambientOcclusion/enabled": False,
     "/rtx/indirectDiffuseGI/enabled": False,
     "/rtx/directLighting/sampledLighting/enabled": False,
     "/rtx/post/dlss/execMode": 0,
+    # Real, concrete render-cost cuts on top of the above - shadows and
+    # antialiasing are both real per-frame GPU cost with zero benefit in
+    # headless mode where nothing is being visually watched, and neither
+    # affects what a captured camera frame looks like to YOLO/DeepFace
+    # (object detection/face-matching don't care about shadow softness or
+    # jagged edges).
+    "/rtx/shadows/enabled": False,
+    "/rtx/post/aa/op": 0,
+    "/app/runLoops/main/rateLimitEnabled": False,
 })
 
 import carb
@@ -184,24 +246,42 @@ for _channel in ("isaacsim.ros2.nodes", "isaacsim.ros2.bridge", "isaacsim.ros2.c
                   "isaacsim.ros2.core.impl.camera_info_utils", "omni.timeline.plugin",
                   "carb"):
     try:
+        # Reverted back to "Error" (from an attempted "Fatal" bump) - that
+        # bump did NOT fix the "sequence size exceeds remaining buffer"
+        # spam (confirming it isn't going through carb's channel logging at
+        # all - likely a raw fprintf from a native plugin, which no log-
+        # level setting can touch), while ALSO suppressing other genuinely
+        # useful console output. The actual fix for that specific message
+        # is run_sim_filtered.bat, which filters the real text stream
+        # instead of fighting the logging system further.
         carb.settings.get_settings().set(f"/log/channels/{_channel}", "Error")
     except Exception:
         pass
 
-# Explicitly enable the ROS2 bridge extension - toggling it on manually in
-# the GUI only applies to that running session and does NOT carry over to a
-# fresh script launch. Without this, /odom, /cmd_vel, /tf etc. are absent
-# and Nav2 has nothing to navigate with.
-import omni.kit.app
-ext_manager = omni.kit.app.get_app().get_extension_manager()
-ext_manager.set_extension_enabled_immediate("isaacsim.ros2.bridge", True)
-print("ROS2 bridge extension explicitly enabled.")
-for _ in range(20):
-    simulation_app.update()
+# ROS2 bridge extension enabling removed - no longer needed, see the
+# comment above `import os` for why.
+
+# EXPERIMENTAL: attempt to force the viewport's "RTX - Minimal" render mode
+# (confirmed present/selectable in the viewport dropdown, not guaranteed to
+# be settable via this exact key). Post-hoc carb.settings calls were
+# already confirmed NOT to reliably affect renderer internals earlier in
+# this project (see the log-channel-suppression comment above), so this is
+# a low-risk try: if the key/value is wrong it should just be silently
+# ignored (same as the earlier "Storm" attempt was), not break startup.
+# If the dropdown doesn't show Minimal selected after launch, this didn't
+# work - just click it manually in the dropdown, which is the confirmed-
+# working zero-risk fallback.
+if USE_MINIMAL_RENDERER:
+    try:
+        carb.settings.get_settings().set("/rtx/rendermode", "RaytracedLighting")
+        carb.settings.get_settings().set("/rtx-transient/dlssg/enabled", False)
+        print("Attempted to force RTX-Minimal render mode (experimental - verify in the viewport dropdown).")
+    except Exception as e:
+        print(f"RTX-Minimal render mode attempt failed harmlessly: {e}")
 
 import omni.usd
 import omni.timeline
-from pxr import Gf, Usd, UsdGeom, UsdPhysics
+from pxr import Gf, Usd, UsdGeom, UsdPhysics, UsdSkel
 import cv2
 import numpy as np
 import subprocess
@@ -213,6 +293,45 @@ import math
 from datetime import datetime, timezone
 from isaacsim.sensors.camera import Camera
 from isaacsim.core.prims import RigidPrim
+
+# THE actual max-speed lever: SimulationContext.step(render=...) lets us
+# step physics/OmniGraph (ROS2 publishers/subscribers, TF, odom, /cmd_vel
+# consumption - all of it) every tick while only paying for a full Hydra
+# render on a fraction of those ticks. Rendering, not physics, is what was
+# capping real-time factor at ~12 updates/sec even with ZERO cameras
+# active (confirmed via the [PERF] log - that ceiling existed before the
+# first camera was ever created) - simulation_app.update() couples a full
+# render to every single tick with no way to separate them. This is the
+# standard, documented Isaac Sim pattern for headless/bulk-physics speed;
+# not a guess, but also not yet verified on THIS build/robot asset, so it's
+# wrapped in the same fail-safe try/except pattern as every other
+# uncertain API call in this file - if SimulationContext or .step(render=)
+# doesn't behave as expected here, this falls back to the old always-render
+# simulation_app.update() behavior rather than silently breaking physics,
+# ROS2, or movement.
+try:
+    from isaacsim.core.api import SimulationContext
+except ImportError:
+    from isaacsim.core.simulation_context import SimulationContext
+
+# Render only 1 in this many ticks when nothing needs a guaranteed real
+# frame this tick (see _tick()'s force_render param, used by capture_frame
+# to always get a real frame when actually capturing). Physics/OmniGraph/
+# ROS2 still step on EVERY tick regardless - only the expensive Hydra
+# render pass gets skipped on the other (RENDER_EVERY_N_TICKS - 1) ticks.
+#
+# Tried 20: steps/sec jumped to 170-290/sec, but the robot never moved at
+# all that run - turned out the WSL nav stack (start_nav_stack.sh) wasn't
+# even running that time, so there were no Nav2 goals being sent at ANY
+# render setting - that test didn't actually tell us anything about this
+# number, my earlier comment claiming it as "confirmed" broken was wrong.
+# Back at 6 (previously confirmed moving the robot end to end WITH the nav
+# stack running) as the safe known-good value. Real test of going higher
+# than 6 has to be run with start_nav_stack.sh actually up in WSL first -
+# check that before touching this number again.
+RENDER_EVERY_N_TICKS = 6
+_sim_context = None
+_render_decouple_supported = True
 
 
 # ---------- Movement helpers ----------
@@ -290,6 +409,34 @@ def repair_broken_tf_publisher_targets(stage):
             print(f"    {node_path}.{rel_name}: {t_str} (found {n} same-name candidates)")
 
 
+def get_animation_loop_seconds(stage, default=1.0):
+    """Scans all UsdSkel.Animation prims stage-wide for the furthest real
+    time sample (rotation/translation) and converts it from timeCodes to
+    seconds using the stage's own timeCodesPerSecond. Used to tell the
+    timeline exactly where the baked Mixamo walk clip ends, so looping
+    wraps back to frame 0 right as the clip finishes instead of guessing
+    an fps/duration and holding on the last frame or looping mid-stride.
+    """
+    from pxr import UsdSkel as _UsdSkel
+    max_time_code = 0.0
+    found_any = False
+    for prim in Usd.PrimRange(stage.GetPseudoRoot()):
+        if not prim.IsA(_UsdSkel.Animation):
+            continue
+        anim = _UsdSkel.Animation(prim)
+        for attr in (anim.GetRotationsAttr(), anim.GetTranslationsAttr()):
+            if not attr:
+                continue
+            samples = attr.GetTimeSamples()
+            if samples:
+                found_any = True
+                max_time_code = max(max_time_code, samples[-1])
+    if not found_any or max_time_code <= 0:
+        return default
+    tcps = stage.GetTimeCodesPerSecond() or 24.0
+    return max_time_code / tcps
+
+
 def get_translate(prim):
     # NOTE: this used to just look for a literal `translate` xformOp and
     # return (0,0,0) if none was found - fine while the robot was
@@ -314,6 +461,33 @@ def set_translate(prim, pos):
     xform.AddTranslateOp().Set(Gf.Vec3d(*pos))
 
 
+def set_world_translate(prim, world_pos):
+    """Sets a prim's position given a WORLD-space target, correctly
+    accounting for its parent's transform - unlike set_translate() (which
+    writes the prim's LOCAL translate op directly), this actually converts
+    world_pos into the right local value first via the parent's inverse
+    world transform.
+
+    Needed specifically for the robot: get_translate() reads WORLD
+    position (via ComputeLocalToWorldTransform), but the patrol people's
+    set_translate() calls write LOCAL translate directly - harmless for
+    them because their prims sit right under /World with an identity
+    parent transform, so local == world. The robot's parent prim
+    (/World/mobile_manipulator_ros) does NOT have an identity transform
+    (almost certainly a scale factor from the URDF/USD import) - writing a
+    world-sized delta straight into local space under a scaled parent
+    caused the position to blow up exponentially every tick (confirmed:
+    the robot flew off to tens of thousands of meters away, accelerating).
+    This is the real fix - always use this for the robot, never raw
+    set_translate().
+    """
+    parent = prim.GetParent()
+    parent_xform = UsdGeom.Xformable(parent)
+    parent_matrix = parent_xform.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+    local_pos = parent_matrix.GetInverse().Transform(Gf.Vec3d(*world_pos))
+    set_translate(prim, local_pos)
+
+
 def set_rotation(prim, degrees_xyz):
     """Sets (or creates) a rotateXYZ xformOp on this prim, in degrees.
     Used to physically collapse a character for the scripted fall event -
@@ -329,6 +503,58 @@ def set_rotation(prim, degrees_xyz):
     xform.AddRotateXYZOp().Set(Gf.Vec3f(*degrees_xyz))
 
 
+def get_skeleton_and_clips(model_prim):
+    """Finds the UsdSkel.Skeleton under this character's model prim, plus
+    the sibling walk/fall/held-fall SkelAnimation clip paths next to it, so
+    the fall event can retarget animationSource between them at runtime
+    instead of faking a collapse via crude whole-body rotation (see the old
+    set_rotation-based fall, replaced below - that just rigidly rotated a
+    mid-stride walk pose, which looked exactly as wrong as it sounds).
+
+    Also computes the fall clip's own real duration in seconds (from its
+    last authored time sample / this stage's timeCodesPerSecond), so
+    update_person_position can switch to the static held-pose clip right
+    when the fall animation finishes playing - without this, the whole
+    scene's shared global timeline loop (much shorter than the ~45s
+    lie-down pause) would keep wrapping back to frame 0 and replaying the
+    collapse from scratch every few seconds during the pause.
+    """
+    if not model_prim.IsValid():
+        return None, None, None, None, 2.0
+    stage = model_prim.GetStage()
+    tcps = stage.GetTimeCodesPerSecond() or 24.0
+    for prim in Usd.PrimRange(model_prim):
+        if prim.IsA(UsdSkel.Skeleton):
+            skel_root = prim.GetParent()
+            walk_path = skel_root.GetPath().AppendChild("mixamo_com")
+            fall_path = skel_root.GetPath().AppendChild("mixamo_fall")
+            held_path = skel_root.GetPath().AppendChild("mixamo_fall_held")
+            fall_duration = 2.0
+            fall_prim = stage.GetPrimAtPath(fall_path)
+            if fall_prim.IsValid():
+                fall_anim = UsdSkel.Animation(fall_prim)
+                rot_attr = fall_anim.GetRotationsAttr()
+                samples = rot_attr.GetTimeSamples() if rot_attr else []
+                if samples:
+                    fall_duration = samples[-1] / tcps
+            return prim, walk_path, fall_path, held_path, fall_duration
+    return None, None, None, None, 2.0
+
+
+def set_animation_clip(skel_prim, clip_path):
+    """Retargets a Skeleton's animationSource relationship to a different
+    SkelAnimation clip prim (walk <-> fall). Both clips already live side
+    by side under the same SkelRoot (see bind_fall_animation.py) - this
+    just repoints which one is currently bound/playing."""
+    if skel_prim is None or not skel_prim.IsValid():
+        return
+    binding = UsdSkel.BindingAPI(skel_prim)
+    rel = binding.GetAnimationSourceRel()
+    if not rel:
+        rel = binding.CreateAnimationSourceRel()
+    rel.SetTargets([clip_path])
+
+
 def disable_physics_recursive(prim):
     if prim.HasAPI(UsdPhysics.RigidBodyAPI):
         rigid_api = UsdPhysics.RigidBodyAPI(prim)
@@ -341,24 +567,173 @@ def disable_physics_recursive(prim):
         disable_physics_recursive(child)
 
 
+# Module-level state for _tick(), the single shared per-frame update function.
+# Populated once in main() right before the main loop starts. Needed because
+# _tick() must be callable from deep inside blocking helpers (run_subprocess,
+# capture_frame) that don't otherwise have access to movers/robot_state/etc,
+# without threading those as parameters through every call site.
+_tick_state = {
+    "sim_start": None,
+    "movers": [],
+    "robot_state": None,
+    "authorized_ids_cache": [],
+    # FPS/real-time-factor instrumentation - see _tick()'s comment below.
+    "tick_count": 0,
+    "tick_window_start": None,
+}
+
+
+def _tick(force_render=False):
+    """The ONE place per-frame work happens: advances mover positions,
+    checks robot arrival, and steps the sim. Every single simulation step
+    anywhere in this script - whether in the main loop or buried inside a
+    blocking wait in run_subprocess()/capture_frame() - goes through this
+    function instead, so movement never silently freezes during the
+    many-second blocking calls a sweep makes (YOLO/DeepFace subprocesses,
+    camera render waits). See run_subprocess() for the full story on why
+    this was necessary (the "teleporting" bug).
+
+    force_render=True guarantees a real Hydra render this tick (used by
+    capture_frame(), which actually needs a frame back) - every other
+    caller lets the render/no-render decision fall through to the
+    RENDER_EVERY_N_TICKS throttle below, since physics/robot-arrival-
+    checking/ROS2 don't need a picture, just a physics step.
+    """
+    global _render_decouple_supported
+    if _tick_state["sim_start"] is None:
+        simulation_app.update()
+        return
+    elapsed = time.time() - _tick_state["sim_start"]
+    for m in _tick_state["movers"]:
+        update_person_position(m, elapsed)
+    if _tick_state["robot_state"] is not None:
+        update_robot(_tick_state["robot_state"], elapsed, _tick_state["authorized_ids_cache"])
+
+    do_render = force_render or (_tick_state["tick_count"] % RENDER_EVERY_N_TICKS == 0)
+    if _render_decouple_supported and _sim_context is not None:
+        try:
+            _sim_context.step(render=do_render)
+        except Exception as e:
+            _render_decouple_supported = False
+            print(f"  [WARN] SimulationContext.step(render=) failed ({e}) - "
+                  f"falling back to always-render simulation_app.update() for the rest of this run.")
+            simulation_app.update()
+    else:
+        simulation_app.update()
+
+    # FPS/real-time-factor instrumentation - diagnosing whether robot
+    # "slowness" is actually a rendering-bottleneck problem (few real
+    # sim steps per real second, meaning little simulated time elapses per
+    # real second regardless of how fast Nav2/the differential controller
+    # are CONFIGURED to move things) rather than a navigation config
+    # problem - every navigation speed knob tuned so far had zero
+    # measurable effect on real-world robot speed, which is what this is
+    # checking for. Now also reports how many of those ticks actually
+    # rendered, so it's obvious whether the render/physics decoupling
+    # above is doing anything.
+    _tick_state["tick_count"] += 1
+    if do_render:
+        _tick_state["render_count"] = _tick_state.get("render_count", 0) + 1
+    if _tick_state["tick_window_start"] is None:
+        _tick_state["tick_window_start"] = time.time()
+    window_elapsed = time.time() - _tick_state["tick_window_start"]
+    if window_elapsed >= 5.0:
+        fps = _tick_state["tick_count"] / window_elapsed
+        render_fps = _tick_state.get("render_count", 0) / window_elapsed
+        print(f"  [PERF] {_tick_state['tick_count']} sim steps ({_tick_state.get('render_count', 0)} rendered) "
+              f"in {window_elapsed:.1f}s real time = {fps:.1f} steps/sec, {render_fps:.1f} rendered/sec")
+        _tick_state["tick_count"] = 0
+        _tick_state["render_count"] = 0
+        _tick_state["tick_window_start"] = time.time()
+
+
 def update_person_position(mover, elapsed):
+    """SIMPLIFIED per explicit direction: people no longer continuously
+    patrol a waypoint loop - that was real, unnecessary movement/animation
+    cost for characters that mostly just need to stand there until a
+    scripted event happens to them. Default behavior now is simply IDLE
+    (do nothing, stay exactly where they are) unless they're the one
+    person currently fallen or loitering.
+
+    Also: invisible by default, only made visible for the duration of
+    their own fall/loiter event (see MakeVisible/MakeInvisible calls
+    below) - there's no reason for an idle bystander nobody's testing
+    right now to be rendered at all, and it makes clear exactly who/when
+    a camera is supposed to be able to see anything. Bound to the HELD
+    (static) pose by default rather than the walk clip too - previously
+    they'd stand there endlessly playing a walk-cycle animation in place
+    since nothing ever explicitly stopped it while idle.
+    """
     # Stand back up once a scripted fall's lie-down duration has elapsed -
-    # reset rotation to upright before resuming normal movement below.
+    # switch the skeleton back to the walk clip.
     if mover.get("fallen") and elapsed >= mover.get("paused_until", 0):
-        set_rotation(mover["prim"], (0, 0, 0))
+        set_animation_clip(mover["skel_prim"], mover["held_clip_path"])
         mover["fallen"] = False
+        mover["fall_held_triggered"] = False
+        # Restore standing height (see fall-trigger below for why it was
+        # dropped).
+        pos = get_translate(mover["prim"])
+        set_translate(mover["prim"], (pos[0], pos[1], mover.get("base_height", pos[2])))
+        UsdGeom.Imageable(mover["prim"]).MakeInvisible()
+
+    # Once the fall ANIMATION itself has finished playing (its own short
+    # duration, typically a couple seconds - much shorter than the whole
+    # lie-down pause), switch to the static held-pose clip. Without this,
+    # the scene's one shared global timeline loop (a few seconds long, set
+    # by whichever clip is longest) keeps wrapping back to frame 0 and
+    # replaying the fall from standing pose over and over for the entire
+    # ~45s pause - this holds the final collapsed pose steady instead.
+    if (mover.get("fallen") and not mover.get("fall_held_triggered")
+            and mover.get("fall_start") is not None
+            and elapsed >= mover["fall_start"] + mover.get("fall_clip_duration", 2.0)):
+        set_animation_clip(mover["skel_prim"], mover["held_clip_path"])
+        mover["fall_held_triggered"] = True
 
     # Trigger this mover's scripted fall once, at their assigned time - a
     # REAL physical collapse at wherever they currently are (patrol or
     # loiter), not a heuristic guess. Fires once via fall_triggered.
+    #
+    # Real fall ANIMATION now (see bind_fall_animation.py) instead of
+    # rigidly rotating the whole model 90 degrees around a mid-stride walk
+    # pose (which looked exactly as broken as it sounds - a contorted,
+    # clearly-not-actually-fallen mess). Movement stays frozen for the
+    # whole FALL_PAUSE_DURATION exactly as before (see the paused_until
+    # check below). Root translation on the fall clip itself is zeroed
+    # (see fix_fall_translation_and_hold.py - the fall clip's raw
+    # translation used a totally different unit/axis convention than the
+    # walk clip and caused floating), so only the fall's ROTATIONS drive
+    # the pose; the character's position stays exactly where they were
+    # standing when they collapsed.
     fall_start = mover.get("fall_start")
     if (fall_start is not None and not mover.get("fall_triggered")
             and elapsed >= fall_start):
         mover["fall_triggered"] = True
         mover["fallen"] = True
+        mover["fall_held_triggered"] = False
         mover["paused_until"] = elapsed + FALL_PAUSE_DURATION
-        axis = random.choice(FALL_ROTATION_OPTIONS)
-        set_rotation(mover["prim"], axis)
+        set_animation_clip(mover["skel_prim"], mover["fall_clip_path"])
+        UsdGeom.Imageable(mover["prim"]).MakeVisible()
+        # Teleport to the assigned fall_center FIRST (see main()'s setup) -
+        # with no more patrol walking, the person's "current position"
+        # would otherwise just be their unmoving spawn point, generally not
+        # inside any camera's view. This guarantees the fall actually
+        # happens somewhere detectable, exactly like loiter_center already
+        # does for the loitering test below.
+        fx, fy = mover.get("fall_center", (None, None))
+        # The fall clip's own root translation is intentionally zeroed (see
+        # fix_fall_translation_and_hold.py - it used a totally different
+        # unit/axis convention than the walk clip and caused floating/wrong
+        # scale), so the character's root stays at STANDING hip height even
+        # though the pose itself rotates to lie flat - that's what was
+        # causing the "floating" look. Drop the outer position down to
+        # compensate, roughly to ground level, restored on stand-up above.
+        FALL_HEIGHT_DROP = 0.75
+        base_z = mover.get("base_height", 0.0)
+        if fx is not None:
+            set_translate(mover["prim"], (fx, fy, base_z - FALL_HEIGHT_DROP))
+        else:
+            pos = get_translate(mover["prim"])
+            set_translate(mover["prim"], (pos[0], pos[1], base_z - FALL_HEIGHT_DROP))
         print(f"*** {mover['name']} has fallen (scripted event) - lying down for {FALL_PAUSE_DURATION}s ***")
 
     # Frozen in place (scripted fall above, or a camera-detection-triggered
@@ -373,61 +748,56 @@ def update_person_position(mover, elapsed):
     if loiter_start is not None:
         loiter_end = loiter_start + mover["loiter_duration"]
         if loiter_start <= elapsed <= loiter_end:
+            if not mover.get("loiter_was_active"):
+                mover["loiter_was_active"] = True
+                UsdGeom.Imageable(mover["prim"]).MakeVisible()
+                set_animation_clip(mover["skel_prim"], mover["walk_clip_path"])
             cx, cy = mover["loiter_center"]
-            x = cx + LOITER_RADIUS * math.sin(elapsed * 0.7)
-            y = cy + LOITER_RADIUS * math.cos(elapsed * 0.5)
-            set_translate(mover["prim"], (x, y, 0))
+            x = cx + LOITER_RADIUS * math.sin(elapsed * 0.35)
+            y = cy + LOITER_RADIUS * math.cos(elapsed * 0.25)
+            z = mover.get("base_height", 0.0)
+            set_translate(mover["prim"], (x, y, z))
             return
+        elif mover.get("loiter_was_active"):
+            # Loiter window just ended - go back to idle/invisible, same
+            # as after a fall recovers.
+            mover["loiter_was_active"] = False
+            set_animation_clip(mover["skel_prim"], mover["held_clip_path"])
+            UsdGeom.Imageable(mover["prim"]).MakeInvisible()
 
-    personal_elapsed = elapsed - mover["start_delay"]
-    if personal_elapsed < 0:
-        return
+    # Otherwise: idle. No more continuous patrol walking - see this
+    # function's docstring for why. They simply stay exactly where they
+    # are (wherever their last event, or spawn, left them) until the next
+    # scripted fall/loiter event moves them.
 
-    total_leg_time = SECONDS_PER_LEG
-    path = mover["path"]
-    full_loop_time = total_leg_time * (len(path) - 1)
 
-    if LOOP_PATROL:
-        personal_elapsed = personal_elapsed % full_loop_time
-
-    leg_index = int(personal_elapsed // total_leg_time)
-    leg_t = (personal_elapsed % total_leg_time) / total_leg_time
-
-    if leg_index >= len(path) - 1:
-        set_translate(mover["prim"], path[-1])
-        return
-
-    p1 = path[leg_index]
-    p2 = path[leg_index + 1]
-    new_pos = (
-        p1[0] + (p2[0] - p1[0]) * leg_t,
-        p1[1] + (p2[1] - p1[1]) * leg_t,
-        p1[2] + (p2[2] - p1[2]) * leg_t,
-    )
-
-    # Face the direction of travel instead of sliding sideways/backwards -
-    # these NVIDIA People characters use -Y as their forward axis (per
-    # NVIDIA's own asset docs), so a Z rotation of atan2(dx, -dy) points
-    # that forward axis at the direction of travel. Add a small vertical
-    # step-bob synced to a walk-cadence-ish frequency for a bit of life -
-    # not a real walk cycle (that requires baked animation clips these
-    # assets don't have bound - see NOTES.md), but a real, guaranteed-to-
-    # work improvement over pure sliding.
-    dx = p2[0] - p1[0]
-    dy = p2[1] - p1[1]
-    if dx != 0 or dy != 0:
-        yaw_deg = math.degrees(math.atan2(dx, -dy))
-        set_rotation(mover["prim"], (0, 0, yaw_deg))
-    bob = 0.04 * abs(math.sin(elapsed * 6.0))
-    new_pos = (new_pos[0], new_pos[1], new_pos[2] + bob)
-
-    set_translate(mover["prim"], new_pos)
+def get_nearest_mover_coords(movers, zone_name):
+    """Returns the actual live (x, y) of whichever mover is currently
+    closest to the given zone - used so the robot is dispatched to where
+    someone actually is right now, not a fixed zone-camera coordinate.
+    Simplified: used to restrict this to "active" (patrolling) movers only,
+    back when some people patrolled and others sat frozen at spawn - now
+    that NOBODY continuously patrols (everyone's idle until their own
+    scripted fall/loiter event, which explicitly teleports them into a
+    zone - see fall_center/loiter_center), every mover is equally valid to
+    consider.
+    """
+    zone_pos = ZONE_CENTERS.get(zone_name)
+    if zone_pos is None or not movers:
+        return zone_pos
+    nearest = min(movers, key=lambda m: (
+        (get_translate(m["prim"])[0] - zone_pos[0]) ** 2 +
+        (get_translate(m["prim"])[1] - zone_pos[1]) ** 2
+    ))
+    npos = get_translate(nearest["prim"])
+    return (npos[0], npos[1])
 
 
 def pause_nearest_mover(movers, zone_name, elapsed):
-    """Freezes whichever patrol character is currently closest to the given
-    zone's coordinates, for FALL_PAUSE_DURATION seconds - simple stand-in
-    for 'the person who fell stays down' until real fall animation exists."""
+    """Freezes whichever patrol character is currently closest to the
+    given zone's coordinates, for FALL_PAUSE_DURATION seconds - simple
+    stand-in for 'the person who fell stays down' until real fall
+    animation exists."""
     zone_pos = ZONE_CENTERS.get(zone_name)
     if zone_pos is None or not movers:
         return
@@ -438,6 +808,53 @@ def pause_nearest_mover(movers, zone_name, elapsed):
     ))
     nearest["paused_until"] = elapsed + FALL_PAUSE_DURATION
     print(f"  [{zone_name}] freezing {nearest['name']} in place for {FALL_PAUSE_DURATION}s (simulating staying down)")
+
+
+def get_robot_yaw_degrees(rigid_prim):
+    """Current robot heading, extracted from its live physics orientation.
+
+    NOTE (one real unverified assumption): assumes Isaac's
+    RigidPrim.get_world_poses() returns orientation quaternions in
+    (w, x, y, z) order - the standard Isaac Sim/pxr convention, but not
+    independently confirmed on THIS robot asset here. If the search loop
+    below seems to wait forever / never detects the robot as having turned
+    to the requested heading, this ordering is the first thing to check
+    (try swapping to (x, y, z, w) and see if it starts working).
+    """
+    _, orientations = rigid_prim.get_world_poses()
+    w, x, y, z = orientations[0]
+    yaw_rad = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    return math.degrees(yaw_rad)
+
+
+def request_robot_search_heading(x, y, yaw_deg, request_id):
+    """UNUSED now that the robot moves kinematically (see search_for_face
+    below, which just sets rotation directly) - kept only because
+    dispatch_bridge.py on the WSL side still references this file if
+    anyone's still running the old nav stack alongside this. Safe to
+    ignore/delete once you've confirmed you don't need that path anymore.
+    """
+    with open(FACE_SEARCH_GOAL_FILE, "w") as f:
+        json.dump({"x": x, "y": y, "yaw_deg": yaw_deg, "request_id": request_id}, f)
+
+
+def wait_for_robot_yaw(rigid_prim, target_yaw_deg, timeout):
+    """Polls the robot's real heading (via _tick(), so physics/rendering
+    keep stepping the whole time - same pattern as run_subprocess's wait)
+    until it's within FACE_SEARCH_YAW_TOLERANCE_DEG of the target, or the
+    timeout is hit. Returns whether it actually got there - if not, the
+    caller scans anyway rather than getting stuck forever on one heading
+    Nav2 can't quite reach (e.g. an obstacle preventing the exact turn).
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        _tick()
+        time.sleep(0.05)
+        current_yaw = get_robot_yaw_degrees(rigid_prim)
+        diff = abs(((current_yaw - target_yaw_deg + 180) % 360) - 180)
+        if diff <= FACE_SEARCH_YAW_TOLERANCE_DEG:
+            return True
+    return False
 
 
 def find_next_unhandled_alert(handled_timestamps):
@@ -458,41 +875,53 @@ def find_next_unhandled_alert(handled_timestamps):
     return None
 
 
-def scan_robot(camera_path, authorized_ids, alert):
-    """Robot's on-arrival scan: same YOLO -> crop -> DeepFace -> authorization
-    pipeline as the fixed checkpoint camera, but mobile - this is the actual
-    'double-check' behavior: a zone camera flagged something, the robot goes
-    there and confirms identity/authorization up close."""
-    print(f"  [ROBOT] arrived at {alert['zone']} ({alert['reason']}) - scanning...")
-    bgr = capture_frame(camera_path, resolution=(1280, 720))
+def attempt_robot_scan(camera_path, authorized_ids, alert, heading_label=""):
+    """One scan attempt from wherever the robot is currently facing -
+    YOLO -> crop -> DeepFace -> authorization, same pipeline as the fixed
+    checkpoint camera. Returns True only on a CONFIRMED identification
+    (face matched an existing person, or a new person was registered) -
+    that's the real success signal the search loop below uses to know
+    when to stop turning and try more headings. "Person visible but no
+    clear face" and "nobody in view" both return False so the search
+    keeps going.
+    """
+    label = f" ({heading_label})" if heading_label else ""
+    print(f"  [ROBOT] scanning{label}...")
+    bgr = capture_frame(camera_path, resolution=(480, 360))
     if bgr is None:
         print("  [ROBOT] no frame captured")
-        return
+        return False
+
+    # Save the FULL raw frame (not just the eventual person crop below) for
+    # every single scan attempt, labeled by standpoint - this is the actual
+    # "let me see what the robot sees" fix. Whatever's going wrong with the
+    # orbit not landing a face (person too small/far, wrong angle, face
+    # occluded, standpoint math off) should be directly visible by paging
+    # through these in order after a run, in
+    # C:\isaacsim\projects\surveillance-proj\debug_captures\.
+    safe_label = (heading_label or "noheading").replace(" ", "_").replace("/", "-")
+    raw_debug_name = f"{datetime.now().strftime('%H%M%S')}_robot_RAWFRAME_{safe_label}.jpg"
+    cv2.imwrite(os.path.join(DEBUG_DIR, raw_debug_name), bgr)
 
     frame_path = os.path.join(os.environ["TEMP"], "robot_scan.jpg")
     cv2.imwrite(frame_path, bgr)
-    yolo_result = run_subprocess("yolo_detect.py", [frame_path])
+    yolo_result = _workers["yolo"].call(frame_path)
     detections = yolo_result.get("detections", []) if not yolo_result.get("error") else []
     if not detections:
-        print("  [ROBOT] nobody found at the alert location")
-        append_log_entry({
-            "event_type": "robot_response", "found": False,
-            "alert_reason": alert.get("reason"), "zone": alert.get("zone"),
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        })
-        return
+        print(f"  [ROBOT] nobody in view{label}")
+        return False
 
     best_detection = max(detections, key=lambda d: d["confidence"])
     crop = crop_person(bgr, best_detection)
     if crop.size == 0:
-        return
+        return False
 
     crop_path = os.path.join(os.environ["TEMP"], "robot_crop.jpg")
     cv2.imwrite(crop_path, crop)
     debug_name = f"{datetime.now().strftime('%H%M%S')}_robot_crop.jpg"
     cv2.imwrite(os.path.join(DEBUG_DIR, debug_name), crop)
 
-    reid_result = run_subprocess("deepface_reid.py", [crop_path, KNOWN_FACES_DIR])
+    reid_result = _workers["deepface"].call(f"{crop_path}\t{KNOWN_FACES_DIR}")
     status = reid_result.get("status")
     person_id = None
 
@@ -505,54 +934,305 @@ def scan_robot(camera_path, authorized_ids, alert):
         cv2.imwrite(os.path.join(KNOWN_FACES_DIR, f"{person_id}.jpg"), crop)
         print(f"  [ROBOT] new person found on-site: {person_id}")
     else:
-        print(f"  [ROBOT] could not get a clear face: {reid_result.get('reason')}")
+        print(f"  [ROBOT] person visible but no clear face{label}: {reid_result.get('reason')}")
+        return False
 
-    if person_id:
-        save_appearance_profile(person_id, crop)
-        is_authorized = person_id in authorized_ids
-        print(f"  [ROBOT] double-check result: {person_id} -> {'AUTHORIZED' if is_authorized else 'NOT AUTHORIZED'}")
-        append_log_entry({
-            "event_type": "robot_response", "found": True,
-            "person_id": person_id, "authorized": is_authorized,
-            "alert_reason": alert.get("reason"), "zone": alert.get("zone"),
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        })
+    save_appearance_profile(person_id, crop)
+    is_authorized = person_id in authorized_ids
+    print(f"  [ROBOT] double-check result: {person_id} -> {'AUTHORIZED' if is_authorized else 'NOT AUTHORIZED'}")
+    append_log_entry({
+        "event_type": "robot_response", "found": True,
+        "person_id": person_id, "authorized": is_authorized,
+        "alert_reason": alert.get("reason"), "zone": alert.get("zone"),
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+    return True
+
+
+def search_for_face(robot_state, alert, authorized_ids):
+    """REAL fix for "the robot just spins in place near the body and finds
+    nothing": rotating the camera at ONE fixed standing spot can never see
+    a face that happens to be oriented away from that spot - no amount of
+    turning changes WHERE the robot is standing. This now actually orbits
+    the target: it physically moves to several standpoints around them
+    (a circle of ORBIT_RADIUS meters, ORBIT_STANDPOINTS positions around
+    it), faces the center from each one, and runs a real vision-based scan
+    (YOLO -> crop -> DeepFace, via attempt_robot_scan) at each standpoint -
+    stopping as soon as one actually succeeds. No ground-truth aiming at a
+    known mover position anymore either - every standpoint is judged
+    purely by what the robot's own camera + YOLO/DeepFace actually see,
+    same as a real system would have to.
+
+    Purely kinematic - moving between standpoints and facing the center is
+    just set_world_translate()/set_rotation() (same as the rest of this
+    file's movement), no physics, no Nav2, instant and reliable by
+    construction.
+    """
+    ORBIT_RADIUS = 4.0       # meters from the target to stand at each standpoint - bumped from 2.0, which was putting the robot's camera almost inside the person (confirmed via saved debug frames: point-blank on their shoes)
+    ORBIT_STANDPOINTS = 6    # trimmed from 8 - fewer forced-render sequences per search now that the target is actually frozen and correctly aimed at
+
+    center = alert["coords"]
+    print(f"  [ROBOT] arrived near {alert['zone']} ({alert['reason']}) - "
+          f"orbiting the target across {ORBIT_STANDPOINTS} standpoints to find a clear view of their face...")
+
+    for step in range(ORBIT_STANDPOINTS):
+        angle = (2 * math.pi / ORBIT_STANDPOINTS) * step
+        standpoint = (center[0] + ORBIT_RADIUS * math.sin(angle),
+                      center[1] + ORBIT_RADIUS * math.cos(angle),
+                      robot_state["base_height"])
+        # Face the CENTER (the person). Now that the camera is our own
+        # SimpleRobot asset (see create_lightweight_robot), it was mounted
+        # specifically to match the SAME body-forward convention used
+        # everywhere else in this file - plain atan2(dx, -dy), no more
+        # special-cased offset math for a mystery mount rotation.
+        dx = center[0] - standpoint[0]
+        dy = center[1] - standpoint[1]
+        face_yaw = math.degrees(math.atan2(dx, -dy))
+        set_world_translate(robot_state["prim"], standpoint)
+        set_rotation(robot_state["prim"], (0.0, 0.0, face_yaw))
+        for _ in range(3):  # let the move/rotation land and a real frame catch up before scanning
+            _tick()
+        if attempt_robot_scan(robot_state["camera_path"], authorized_ids, alert,
+                               heading_label=f"standpoint {step + 1}/{ORBIT_STANDPOINTS}"):
+            print(f"  [ROBOT] face search succeeded from standpoint {step + 1}/{ORBIT_STANDPOINTS}")
+            return
+
+    print(f"  [ROBOT] face search exhausted all {ORBIT_STANDPOINTS} orbit standpoints without a confirmed identification")
+    append_log_entry({
+        "event_type": "robot_response", "found": False,
+        "alert_reason": alert.get("reason"), "zone": alert.get("zone"),
+        "note": "face search exhausted all orbit standpoints",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+
+
+def simplify_robot_visuals(stage, robot_prim_path, keep_path_substrings):
+    """Hides every Mesh prim under the robot EXCEPT ones whose path
+    contains one of keep_path_substrings (the camera mount chain, so you
+    can still see it turn to look at people) - pure render-cost cut, zero
+    functional impact, since none of this script's movement/rotation logic
+    touches mesh geometry at all, only the base_footprint prim's transform
+    ops. This is the concrete "make it a skeleton except the part that
+    needs to rotate" request - a full mobile-manipulator mesh (wheels,
+    chassis, sensor housings, etc.) is a lot of triangles to keep rendering
+    every frame for a demo that doesn't need to look detailed.
+
+    Hiding via UsdGeom.Imageable.MakeInvisible() rather than deleting/
+    unloading - completely reversible (just call MakeVisible() later) and
+    doesn't disturb the prim hierarchy or any transform ops.
+    """
+    robot_prim = stage.GetPrimAtPath(robot_prim_path)
+    if not robot_prim.IsValid():
+        print(f"  [simplify_robot] robot prim not found at {robot_prim_path}, skipping.")
+        return
+    hidden = 0
+    kept = 0
+    for prim in Usd.PrimRange(robot_prim):
+        if not prim.IsA(UsdGeom.Mesh):
+            continue
+        path_str = str(prim.GetPath())
+        if any(sub in path_str for sub in keep_path_substrings):
+            kept += 1
+            continue
+        UsdGeom.Imageable(prim).MakeInvisible()
+        hidden += 1
+    print(f"  [simplify_robot] hid {hidden} mesh(es), kept {kept} mesh(es) matching {keep_path_substrings}.")
+
+
+def create_lightweight_robot(stage):
+    """Replaces the heavy mobile_manipulator_ros asset entirely. That asset
+    dragged in a full ROS2/Nav2/PhysX-oriented rig (wheel joints, a
+    differential controller, lidar sensors, a manipulator arm, broken TF
+    frames) for a project that, by this point, uses none of that -
+    movement has been fully kinematic for a while, and ROS2 was never
+    actually driving anything by the end. Keeping that whole asset around
+    just for its camera mount was real, unnecessary prim-count/render cost,
+    on top of being the actual source of the 120-degree camera-mount-offset
+    problem that took a whole session to reverse-engineer.
+
+    This creates a tiny robot from scratch instead: a slim, person-height
+    body (a cylinder, not a squat cube - you specifically asked for
+    "personable height" so the camera sits at realistic face-scanning
+    height instead of somewhere down near people's knees) plus a camera
+    mounted near the top, at a rotation WE choose and control -
+    specifically chosen so the camera's forward axis matches the EXACT
+    SAME body-forward convention already used everywhere else in this file
+    (atan2(dx, -dy), same as update_person_position/update_robot's
+    movement-facing math). So "aim the camera at something" is now just
+    "use the same yaw formula you'd use to face that direction" - no more
+    special-cased offset math, anywhere, ever again for this asset.
+    """
+    BODY_HEIGHT = 1.6   # meters - person-scale, not a squat box
+    BODY_RADIUS = 0.18
+    CAMERA_HEIGHT = 1.55  # near the top of the body - roughly adult face height
+
+    root_path = "/World/SimpleRobot"
+    root_xform = UsdGeom.Xform.Define(stage, root_path)
+    root_prim = root_xform.GetPrim()
+    root_xform.AddTranslateOp()
+    root_xform.AddRotateXYZOp()
+
+    body_path = root_path + "/body"
+    body = UsdGeom.Cylinder.Define(stage, body_path)
+    body.CreateHeightAttr(BODY_HEIGHT)
+    body.CreateRadiusAttr(BODY_RADIUS)
+    body.CreateAxisAttr("Z")
+    UsdGeom.Xformable(body.GetPrim()).AddTranslateOp().Set(Gf.Vec3d(0, 0, BODY_HEIGHT / 2))
+
+    camera_path = root_path + "/camera"
+    camera = UsdGeom.Camera.Define(stage, camera_path)
+    cam_xform = UsdGeom.Xformable(camera.GetPrim())
+    cam_xform.AddTranslateOp().Set(Gf.Vec3d(0, 0, CAMERA_HEIGHT))
+    # A USD camera's default local look direction is -Z. Rotating -90 deg
+    # about local X maps local -Z onto local -Y - i.e. at yaw=0 (root
+    # unrotated), this camera looks toward world -Y, exactly matching
+    # update_person_position's f0=(0,-1,0) body-forward convention. Verified
+    # by hand (Rodrigues rotation of (0,0,-1) by -90 deg about X = (0,-1,0)),
+    # not left to guesswork this time.
+    cam_xform.AddRotateXYZOp().Set(Gf.Vec3f(-90, 0, 0))
+
+    print(f"Created lightweight replacement robot at {root_path} (camera at {camera_path}).")
+    return root_prim, camera_path
 
 
 def update_robot(robot_state, elapsed, authorized_ids):
-    """The robot is no longer moved by this script at all - it's driven by
-    real PhysX physics under Nav2's control, via the WSL-side
-    dispatch_bridge.py sending real NavigateToPose goals (patrol waypoints
-    when idle, dispatch_alert coords when one exists - see PATROL_WAYPOINTS_FILE
-    and EVENT_LOG_FILE). This function's only job is to watch the robot's
-    REAL position and, once it's physically close enough to an unhandled
-    dispatch alert's coordinates, trigger the on-arrival checkpoint-style scan.
+    """Fully kinematic robot movement - moves and rotates the robot prim
+    directly, exactly like update_person_position() does for the patrol
+    people, instead of watching real PhysX/Nav2-driven motion. No physics,
+    no wheels, no ROS2/WSL dependency for movement at all.
+
+    Behavior: patrols ROBOT_WAYPOINTS in a loop by default. Every
+    ROBOT_CHECK_INTERVAL seconds, checks the event log for a new unhandled
+    dispatch alert - if one exists and isn't already the current target,
+    it INTERRUPTS the patrol and heads there instead (higher priority than
+    finishing the current patrol leg). On arrival at an alert's coords,
+    runs the same active face search as before, then resumes patrol.
     """
-    if elapsed - robot_state["last_check"] < ROBOT_CHECK_INTERVAL:
+    # search_for_face() calls _tick() internally (to keep rendering/physics
+    # moving during the pause-then-scan sequence), which calls straight
+    # back into this function. Without this guard, every one of those
+    # inner calls saw no current_target (cleared right before entering the
+    # search, to stop a different recursion bug) and picked a fresh patrol
+    # waypoint - so the robot visibly walked away mid-search instead of
+    # standing still to scan, and the alert-check below kept firing
+    # "new dispatch alert" repeatedly during the same search. This makes
+    # every nested call a complete no-op until the search actually finishes.
+    if robot_state.get("in_search"):
         return
-    robot_state["last_check"] = elapsed
 
-    alert = find_next_unhandled_alert(robot_state["handled_timestamps"])
-    if alert is None:
-        return
+    dt = elapsed - robot_state.get("last_move_time", elapsed)
+    robot_state["last_move_time"] = elapsed
 
-    # Query the LIVE physics position directly via RigidPrim, not the USD
-    # stage's authored xform attributes. PhysX runs on a fast internal data
-    # layer ("Fabric") for performance and does not reliably write results
-    # back into the USD stage attributes that UsdGeom.Xformable reads from -
-    # the robot visually moves fine (rendering reads from Fabric directly),
-    # but get_translate() was reading stale/default data, so arrival never
-    # triggered no matter how close the robot actually got. get_world_poses()
-    # queries the physics simulation state directly and is reliable.
-    positions, _ = robot_state["rigid_prim"].get_world_poses()
-    current = positions[0]
-    target = alert["coords"]
-    dist = math.hypot(current[0] - target[0], current[1] - target[1])
-    print(f"  [ROBOT] checking arrival: at ({current[0]:.2f}, {current[1]:.2f}), "
-          f"target ({target[0]:.2f}, {target[1]:.2f}), dist={dist:.2f}m")
+    # Periodically check for a new higher-priority alert to interrupt
+    # patrol with - gated by ROBOT_CHECK_INTERVAL since this does file I/O
+    # (find_next_unhandled_alert reads EVENT_LOG_FILE), unlike the actual
+    # movement below which needs to run every single tick to be smooth.
+    if elapsed - robot_state["last_check"] >= ROBOT_CHECK_INTERVAL:
+        robot_state["last_check"] = elapsed
+        alert = find_next_unhandled_alert(robot_state["handled_timestamps"])
+        if alert is not None and alert is not robot_state.get("current_alert"):
+            robot_state["current_alert"] = alert
+            robot_state["current_target"] = tuple(alert["coords"])
+            print(f"  [ROBOT] new dispatch alert - interrupting patrol, heading to {alert['coords']} ({alert['reason']})")
+
+    # No target yet (first tick, or just finished handling something) -
+    # pick the next patrol waypoint.
+    if robot_state.get("current_target") is None:
+        wp = ROBOT_WAYPOINTS[robot_state["waypoint_index"]]
+        robot_state["current_target"] = (wp[0], wp[1])
+
+    # THE REAL FIX for "the robot drives right past them and finds nothing":
+    # current_target for a person-triggered alert used to be a ONE-TIME
+    # coordinate snapshot taken the instant the alert fired. The person
+    # keeps walking after that. By the time the robot crosses the room to
+    # that now-stale point, they're gone - the robot arrives to an empty
+    # spot every time, exactly what was happening. Fix: while chasing an
+    # alert (current_alert is set), re-fetch the actual person's LIVE
+    # position and overwrite current_target with it, every single tick -
+    # continuous tracking, not a snapshot. Only correct in general when
+    # there's exactly one mover total - with more than one there's no way
+    # to know which one the alert was actually about from here, so this
+    # deliberately falls back to the static snapshot coords in that case
+    # rather than guessing wrong.
+    if robot_state.get("current_alert") is not None:
+        movers = _tick_state.get("movers", [])
+        if len(movers) == 1:
+            live_pos = get_translate(movers[0]["prim"])
+            robot_state["current_target"] = (live_pos[0], live_pos[1])
+
+    pos = get_translate(robot_state["prim"])
+    tx, ty = robot_state["current_target"]
+    dx = tx - pos[0]
+    dy = ty - pos[1]
+    dist = math.hypot(dx, dy)
+
     if dist <= ARRIVAL_RADIUS:
-        scan_robot(ROBOT_CAMERA_PATH, authorized_ids, alert)
-        robot_state["handled_timestamps"].add(alert["timestamp"])
+        alert = robot_state.get("current_alert")
+        # Use the LIVE target position at the moment of arrival as the
+        # orbit center, not the alert's original stale coordinate snapshot
+        # - for a loitering/unauthorized alert the person may have kept
+        # moving during the chase (current_target was continuously updated
+        # above to track them), so by arrival time current_target IS their
+        # real current position and alert["coords"] is outdated. For a
+        # fall alert they're frozen so both are the same anyway - this is
+        # strictly more correct in both cases, never worse.
+        if alert is not None:
+            alert = dict(alert)
+            alert["coords"] = robot_state["current_target"]
+        # Clear state BEFORE calling search_for_face, not after - real bug
+        # found here: search_for_face() calls _tick() internally (to keep
+        # rendering/physics moving during the pause-then-scan sequence),
+        # and _tick() calls straight back into update_robot(). With the
+        # old order (clear state after search_for_face returns), every one
+        # of those inner _tick() calls saw the robot still "arrived" with
+        # current_alert still set, and called search_for_face() AGAIN from
+        # inside itself - infinite recursion until Python's stack blew up.
+        # Clearing current_alert/current_target first means those inner
+        # _tick() calls see no active alert and just fall through to
+        # normal movement/patrol logic instead of re-triggering the search.
+        robot_state["current_alert"] = None
+        robot_state["current_target"] = None
+        if alert is not None:
+            # REAL FIX for consistent 8/8 orbit failures: nothing was
+            # stopping the person from continuing to walk their patrol
+            # route WHILE the robot spent real seconds moving between all
+            # 8 orbit standpoints. The orbit center was fixed at arrival,
+            # but by standpoint 3-4 the person had already walked away
+            # from it - every single search was chasing a target that kept
+            # moving out from under it. Freeze every mover for the
+            # duration of the search, then restore their exact original
+            # paused_until afterward (so this can't accidentally shorten a
+            # legitimate longer freeze already in progress, e.g. mid
+            # scripted fall).
+            movers = _tick_state.get("movers", [])
+            saved_pause = {m["name"]: m.get("paused_until", 0) for m in movers}
+            for m in movers:
+                m["paused_until"] = elapsed + 300  # comfortably longer than any search will take
+            robot_state["in_search"] = True
+            try:
+                search_for_face(robot_state, alert, authorized_ids)
+            finally:
+                robot_state["in_search"] = False
+                for m in movers:
+                    m["paused_until"] = saved_pause[m["name"]]
+            robot_state["handled_timestamps"].add(alert["timestamp"])
+        else:
+            robot_state["waypoint_index"] = (robot_state["waypoint_index"] + 1) % len(ROBOT_WAYPOINTS)
+        return
+
+    # Move toward the target at ROBOT_MOVE_SPEED, capped so a big dt (e.g.
+    # right after a long blocking sweep call) can't overshoot past the
+    # target and start oscillating.
+    step_dist = min(ROBOT_MOVE_SPEED * dt, dist)
+    if dist > 0:
+        new_world_pos = (pos[0] + dx / dist * step_dist, pos[1] + dy / dist * step_dist, robot_state["base_height"])
+        yaw_deg = math.degrees(math.atan2(dx, -dy))  # same forward-axis convention as update_person_position
+        set_rotation(robot_state["prim"], (0.0, 0.0, yaw_deg))
+        set_world_translate(robot_state["prim"], new_world_pos)  # NOT set_translate() - see set_world_translate()'s comment for why
+
+    if int(elapsed) % 3 == 0 and dt > 0:  # throttled print, same cadence feel as the old version
+        print(f"  [ROBOT] moving: at ({pos[0]:.2f}, {pos[1]:.2f}), "
+              f"target ({tx:.2f}, {ty:.2f}), dist={dist:.2f}m")
 
 
 # ---------- Tracking helpers ----------
@@ -591,13 +1271,18 @@ def append_log_entry(entry):
 _camera_cache = {}
 
 
-def capture_frame(camera_path, resolution=(640, 480)):
+_camera_pause_supported = True  # flips to False if .pause()/.resume() ever throw, so we stop trying and stop pretending it's helping
+
+
+def capture_frame(camera_path, resolution=(320, 240)):
     # Reuse one Camera object per path instead of creating a new one (and a
     # new render product/annotator) on every single scan call - doing that
     # every 8s for 5 cameras leaked render products, overran internal render
     # buffers ("sequence size exceeds remaining buffer" spam), and stalled
     # the physics step rate badly enough to starve the ROS2 odom publisher.
+    global _camera_pause_supported
     camera = _camera_cache.get(camera_path)
+    just_created = camera is None
     if camera is None:
         camera = Camera(prim_path=camera_path, resolution=resolution)
         camera.initialize()
@@ -611,18 +1296,140 @@ def capture_frame(camera_path, resolution=(640, 480)):
         for _ in range(10):
             simulation_app.update()
 
+    # REAL FIX for the "robot crawls at 0.1 m/s" ceiling: once a camera got
+    # cached above, it was left permanently active for the rest of the run -
+    # every one of the 7 cameras in this scene (5 zones + checkpoint + robot)
+    # was rendering its own full render product on EVERY simulation_app.update()
+    # call, including the 90%+ of wall-clock time between sweeps when the
+    # robot/people should be moving at full speed and nothing is even being
+    # captured. That's the actual "GPU render cost / 6+ simultaneous render
+    # products" ceiling from NOTES.md - it isn't a fixed hardware wall, it's
+    # 6 idle cameras rendering for no reason. Nav2's vx_max and the
+    # differential_controller node are both already maxed (10.0 m/s) -
+    # raising either further does nothing, because the bottleneck is real
+    # SIMULATED seconds per REAL second (see the [PERF] updates/sec log
+    # line), not the commanded velocity.
+    #
+    # Fix: only the camera actively being captured stays "resumed" (its
+    # render product ticking); every cached camera goes back to .pause()
+    # immediately after its frame is grabbed, so idle cameras cost ~nothing
+    # per tick instead of a full render each. Camera.pause()/.resume() are
+    # real public isaacsim.sensors.camera.Camera methods, but wrapped
+    # defensively anyway per this project's own convention - if this Isaac
+    # Sim build's version behaves differently, it fails safe (frames keep
+    # working exactly as before, just without the speed gain) instead of
+    # breaking capture. Watch the [PERF] updates/sec line after this change -
+    # that's the real test, not just "did the robot look faster."
+    if _camera_pause_supported and not just_created:
+        try:
+            camera.resume()
+        except Exception as e:
+            _camera_pause_supported = False
+            print(f"  [WARN] Camera.resume() not supported on this build ({e}) - "
+                  f"disabling the pause/resume optimization, falling back to always-on cameras.")
+
     rgba = None
-    for i in range(60):
-        simulation_app.update()
+    for i in range(20):  # cut from 60 - each iteration in this loop is a full forced real render at full window resolution; most successful captures land in the first few iterations anyway, this just caps the worst-case lag spike from a slow/stuck capture
+        _tick(force_render=True)  # this loop actually needs a real frame back every time, unlike every other _tick() caller in this file
         rgba = camera.get_rgba()
         if rgba is not None and rgba.size > 0:
             break
+
+    if _camera_pause_supported:
+        try:
+            camera.pause()
+        except Exception as e:
+            _camera_pause_supported = False
+            print(f"  [WARN] Camera.pause() not supported on this build ({e}) - "
+                  f"disabling the pause/resume optimization, falling back to always-on cameras.")
 
     if rgba is None or rgba.size == 0:
         return None
 
     rgb = rgba[:, :, :3]
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
+class PersistentWorker:
+    """Keeps a single long-running python.bat subprocess alive for the
+    whole session, communicating via stdin/stdout - one request per line
+    in, one JSON response per line out. Used for yolo_worker.py and
+    deepface_worker.py, which load their (expensive) models ONCE at
+    startup instead of on every single call, unlike run_subprocess()'s
+    spawn-fresh-every-time pattern (still used elsewhere for cheap one-off
+    scripts). This was the dominant real cost behind the whole "everything
+    is so slow" investigation - not render resolution, not GPU rendering
+    contention (both real, but secondary) - full model reloads happening
+    5-6 times per single 8-second sweep cycle, every sweep, for the entire
+    session.
+
+    Reads happen on a background thread into a queue rather than a
+    blocking readline() in the main thread, so the caller can keep calling
+    _tick() (physics/movement/rendering) while waiting for a response,
+    same pattern as run_subprocess()'s own polling loop.
+    """
+
+    def __init__(self, script_name):
+        import threading
+        import queue as _queue
+        script_path = os.path.join(PROJECT_DIR, script_name)
+        self.proc = subprocess.Popen(
+            ['C:\\isaacsim\\python.bat', script_path],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", bufsize=1
+        )
+        self._queue_mod = _queue
+        self.out_queue = _queue.Queue()
+        self.reader_thread = threading.Thread(target=self._read_loop, daemon=True)
+        self.reader_thread.start()
+        self.ready = False
+
+    def _read_loop(self):
+        for line in self.proc.stdout:
+            stripped = line.strip()
+            if stripped:
+                self.out_queue.put(stripped)
+
+    def wait_ready(self, timeout=120):
+        start = time.time()
+        while time.time() - start < timeout:
+            _tick()
+            try:
+                line = self.out_queue.get(timeout=0.05)
+                if line == "READY":
+                    self.ready = True
+                    return True
+            except self._queue_mod.Empty:
+                continue
+        return False
+
+    def call(self, request_line, timeout=30):
+        if self.proc.poll() is not None:
+            return {"error": "worker process has exited"}
+        try:
+            self.proc.stdin.write(request_line + "\n")
+            self.proc.stdin.flush()
+        except Exception as e:
+            return {"error": f"failed to write to worker: {e}"}
+        start = time.time()
+        while time.time() - start < timeout:
+            _tick()
+            try:
+                line = self.out_queue.get(timeout=0.05)
+            except self._queue_mod.Empty:
+                continue
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+        return {"error": "worker call timed out"}
+
+
+# Module-level worker handles, populated once in main() before the sweep
+# loop starts. Needed at module level (not local to main()) since
+# scan_zone_camera/scan_checkpoint/attempt_robot_scan are all separate
+# top-level functions that need to reach them.
+_workers = {"yolo": None, "deepface": None}
 
 
 def run_subprocess(script_name, args):
@@ -634,13 +1441,27 @@ def run_subprocess(script_name, args):
     # they kept arriving fine on the ROS2 wire (which is why `ros2 topic hz`
     # looked healthy while the robot barely moved). Using Popen + polling
     # keeps physics/rendering stepping the whole time this runs.
+    #
+    # IMPORTANT: this polling loop calls _tick() (movement + robot update +
+    # simulation_app.update()), NOT just simulation_app.update() alone. A
+    # single sweep runs 5 cameras x 2 subprocess calls (YOLO + DeepFace)
+    # each taking multiple seconds, so this loop is where the vast majority
+    # of each sweep's ~25-30s wall-clock time is actually spent. Previously
+    # movement was computed only in main()'s outer loop, which is blocked
+    # here for that entire duration - elapsed (wall-clock time.time()) kept
+    # advancing the whole time regardless, so the very next movement update
+    # after a sweep finished would jump straight to wherever ~25-30s of
+    # progress along the patrol path landed, looking like a teleport. Now
+    # movement is updated on every single simulation_app.update() call,
+    # including all the ones spent waiting here, so it stays smooth
+    # throughout a sweep instead of freezing then jumping.
     proc = subprocess.Popen(
         f'"C:\\isaacsim\\python.bat" "{script_path}" {arg_str}',
         shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace"
     )
     while proc.poll() is None:
-        simulation_app.update()
+        _tick()
         time.sleep(0.01)
     stdout, stderr = proc.communicate()
     if proc.returncode != 0:
@@ -744,9 +1565,19 @@ def check_loitering(zone_name, streak_state, threshold=LOITER_THRESHOLD):
     return False
 
 
-def scan_zone_camera(camera_path, zone_name):
+def scan_zone_camera(camera_path, zone_name, movers):
+    """Zone cameras ONLY detect + check fall/loitering now - DeepFace
+    identification was removed entirely from this path per explicit scope
+    cut: fall and loitering detection only need YOLO's bounding box shape
+    and a presence streak, never WHO the person is. Running full face
+    re-identification on every one of 4 zone cameras every single 8-second
+    sweep was a large, unnecessary, recurring cost that had nothing to do
+    with this project's actual stated goal. Identification still happens
+    at the fixed checkpoint camera and via the robot's own orbit search -
+    neither of those changed.
+    """
     print(f"  scanning {zone_name}...")
-    bgr = capture_frame(camera_path)
+    bgr = capture_frame(camera_path, resolution=(160, 120))
     if bgr is None:
         return None
 
@@ -754,7 +1585,7 @@ def scan_zone_camera(camera_path, zone_name):
     frame_path = os.path.join(os.environ["TEMP"], f"scan_{tag}.jpg")
     cv2.imwrite(frame_path, bgr)
 
-    yolo_result = run_subprocess("yolo_detect.py", [frame_path])
+    yolo_result = _workers["yolo"].call(frame_path)
     if yolo_result.get("error"):
         return {"error": f"YOLO: {yolo_result['error']}"}
 
@@ -778,43 +1609,29 @@ def scan_zone_camera(camera_path, zone_name):
             "reason": "fall",
             "person_id": None,
             "zone": zone_name,
-            "coords": ZONE_CENTERS.get(zone_name),
+            "coords": get_nearest_mover_coords(movers, zone_name),
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
 
+    # Still save a debug crop image for visual sanity-checking - this is
+    # just a file write, not a DeepFace inference call, effectively free.
     crop = crop_person(bgr, best_detection)
-    if crop.size == 0:
-        return {"error": "empty crop", "fell": fell}
+    if crop.size > 0:
+        debug_name = f"{datetime.now().strftime('%H%M%S')}_{tag}_crop.jpg"
+        cv2.imwrite(os.path.join(DEBUG_DIR, debug_name), crop)
 
-    crop_path = os.path.join(os.environ["TEMP"], f"crop_{tag}.jpg")
-    cv2.imwrite(crop_path, crop)
-
-    debug_name = f"{datetime.now().strftime('%H%M%S')}_{tag}_crop.jpg"
-    cv2.imwrite(os.path.join(DEBUG_DIR, debug_name), crop)
-
-    reid_result = run_subprocess("deepface_reid.py", [crop_path, KNOWN_FACES_DIR])
-    if reid_result.get("status") == "match":
-        matched_filename = os.path.basename(reid_result["matched_path"])
-        person_id = os.path.splitext(matched_filename)[0]
-        return {"person_id": person_id, "distance": reid_result["distance"], "match_type": "face", "fell": fell}
-    else:
-        # Face detection failed or didn't match - fall back to clothing/color
-        # signature, which is far more reliable from wide zone camera angles.
-        appearance_id, appearance_score = find_appearance_match(crop)
-        if appearance_id:
-            return {"person_id": appearance_id, "score": appearance_score, "match_type": "clothing", "fell": fell}
-        return {"person_id": "unidentified", "reason": reid_result.get("reason", "no match"), "fell": fell}
+    return {"detected": True, "fell": fell}
 
 
 def scan_checkpoint(authorized_ids):
     print(f"  scanning checkpoint...")
-    bgr = capture_frame(CHECKPOINT_PATH, resolution=(1280, 720))
+    bgr = capture_frame(CHECKPOINT_PATH, resolution=(480, 360))
     if bgr is None:
         return
 
     frame_path = os.path.join(os.environ["TEMP"], "checkpoint_scan.jpg")
     cv2.imwrite(frame_path, bgr)
-    yolo_result = run_subprocess("yolo_detect.py", [frame_path])
+    yolo_result = _workers["yolo"].call(frame_path)
     detections = yolo_result.get("detections", []) if not yolo_result.get("error") else []
     if not detections:
         return
@@ -840,7 +1657,7 @@ def scan_checkpoint(authorized_ids):
     debug_name = f"{datetime.now().strftime('%H%M%S')}_checkpoint_crop.jpg"
     cv2.imwrite(os.path.join(DEBUG_DIR, debug_name), crop)
 
-    reid_result = run_subprocess("deepface_reid.py", [crop_path, KNOWN_FACES_DIR])
+    reid_result = _workers["deepface"].call(f"{crop_path}\t{KNOWN_FACES_DIR}")
 
     person_id = None
     status = reid_result.get("status")
@@ -877,7 +1694,7 @@ def run_sweep(camera_zones, authorized_ids, streak_state, movers, elapsed):
     print(f"\n--- Sweep at {timestamp} ---")
 
     for camera_path, zone_name in camera_zones.items():
-        result = scan_zone_camera(camera_path, zone_name)
+        result = scan_zone_camera(camera_path, zone_name, movers)
 
         if result is None or result.get("error"):
             # Nobody detected (or a scan error) - the presence streak breaks here.
@@ -891,37 +1708,21 @@ def run_sweep(camera_zones, authorized_ids, streak_state, movers, elapsed):
             pause_nearest_mover(movers, zone_name, elapsed)
 
         streak_state[zone_name]["streak"] += 1
+        print(f"  [{zone_name}] person detected (streak={streak_state[zone_name]['streak']})")
 
-        person_id = result["person_id"]
-        match_type = result.get("match_type", "none")
-        tag = f" (via {match_type})" if match_type != "none" else ""
-        print(f"  [{zone_name}] {person_id}{tag}")
-
-        # Authorization check happens here too, not just at the checkpoint -
-        # if we know who someone is (via face OR clothing) and they're not
-        # on the authorized list, that's a dispatchable alert with a real
-        # location attached for the robot to go investigate/double-check.
-        if person_id not in (None, "unidentified") and person_id not in authorized_ids:
-            coords = ZONE_CENTERS.get(zone_name)
-            print(f"  [{zone_name}] *** UNAUTHORIZED PRESENCE: {person_id} - dispatch coords {coords} ***")
-            append_log_entry({
-                "event_type": "dispatch_alert",
-                "reason": "unauthorized_zone_presence",
-                "person_id": person_id,
-                "zone": zone_name,
-                "coords": coords,
-                "match_type": match_type,
-                "timestamp": timestamp
-            })
+        # unauthorized_zone_presence removed along with zone-camera face/
+        # clothing identification - that alert type depended entirely on
+        # knowing WHO was detected, which zone cameras no longer check
+        # (out of scope per explicit direction: zone cameras are fall/
+        # loitering detection only). Identity/authorization checks still
+        # happen at the checkpoint camera and via the robot's own search.
 
         if check_loitering(zone_name, streak_state):
-            coords = ZONE_CENTERS.get(zone_name)
+            coords = get_nearest_mover_coords(movers, zone_name)
             print(f"  [{zone_name}] *** LOITERING (someone present {LOITER_THRESHOLD}+ sweeps in a row) ***")
-            if person_id not in (None, "unidentified"):
-                pause_nearest_mover(movers, zone_name, elapsed)
+            pause_nearest_mover(movers, zone_name, elapsed)
             append_log_entry({
                 "event_type": "loitering_alert",
-                "person_id": person_id,
                 "zone": zone_name,
                 "coords": coords,
                 "timestamp": timestamp
@@ -929,7 +1730,7 @@ def run_sweep(camera_zones, authorized_ids, streak_state, movers, elapsed):
             append_log_entry({
                 "event_type": "dispatch_alert",
                 "reason": "loitering",
-                "person_id": person_id,
+                "person_id": None,
                 "zone": zone_name,
                 "coords": coords,
                 "timestamp": timestamp
@@ -937,13 +1738,13 @@ def run_sweep(camera_zones, authorized_ids, streak_state, movers, elapsed):
 
         append_log_entry({
             "event_type": "zone",
-            "person_id": person_id,
             "zone": zone_name,
             "camera": camera_path,
             "timestamp": timestamp
         })
 
-    scan_checkpoint(authorized_ids)
+    if CHECKPOINT_AVAILABLE:
+        scan_checkpoint(authorized_ids)
 
 
 # ---------- Main ----------
@@ -967,19 +1768,37 @@ def main():
 
     stage = usd_context.get_stage()
 
-    # The piper arm is set up as a USD payload - unloading it excludes it
-    # from the scene entirely (non-destructive, can be re-enabled later via
-    # .Load()) which stops the ungoverned arm-flailing we saw, since there's
-    # simply no arm geometry/physics present to flail.
-    piper_arm_prim = stage.GetPrimAtPath("/World/mobile_manipulator_ros/piper_arm")
-    if piper_arm_prim.IsValid():
-        piper_arm_prim.Unload()
-        print("Piper arm payload unloaded (disabled).")
-    else:
-        print("WARNING: piper_arm prim not found - nothing to unload.")
+    # Check for real (not guessed) whether a checkpoint camera actually
+    # exists in this scene - see CHECKPOINT_AVAILABLE's comment above.
+    global CHECKPOINT_AVAILABLE
+    CHECKPOINT_AVAILABLE = stage.GetPrimAtPath(CHECKPOINT_PATH).IsValid()
+    if not CHECKPOINT_AVAILABLE:
+        print(f"No checkpoint camera found at {CHECKPOINT_PATH} in this scene - "
+              f"checkpoint scanning disabled for this run (zone cameras + robot orbit search still work normally).")
 
-    print("Attempting to repair broken TF publisher prim references...")
-    repair_broken_tf_publisher_targets(stage)
+    # Set up the physics/render decoupling (see the RENDER_EVERY_N_TICKS
+    # comment near the top of this file) now that a stage is actually
+    # loaded - SimulationContext needs a stage to attach to. Wrapped
+    # defensively: if this build's SimulationContext doesn't accept these
+    # exact kwargs or .step() doesn't support render=, _tick() already
+    # falls back to plain simulation_app.update() (checked via
+    # _sim_context is None / _render_decouple_supported), so a failure
+    # here just means no speed gain, not a broken run.
+    global _sim_context, _render_decouple_supported
+    try:
+        _sim_context = SimulationContext.instance() or SimulationContext()
+        print("SimulationContext acquired - physics/render decoupling active "
+              f"(rendering 1 in every {RENDER_EVERY_N_TICKS} ticks outside of active captures).")
+    except Exception as e:
+        _render_decouple_supported = False
+        _sim_context = None
+        print(f"  [WARN] Could not acquire SimulationContext ({e}) - "
+              f"physics/render decoupling disabled, falling back to always-render ticks.")
+
+    # The piper arm / TF-repair logic below was specific to the old heavy
+    # mobile_manipulator_ros asset, which has been fully replaced by
+    # create_lightweight_robot() - removed rather than left as dead code
+    # that silently does nothing every run.
 
     # Bump ambient/dome light intensity so the scene is flat-lit and bright
     # enough for detection without needing expensive indirect
@@ -1007,50 +1826,67 @@ def main():
             continue
         disable_physics_recursive(prim)
         start = get_translate(prim)
-        full_path = [(start[0], start[1], start[2])] + WAYPOINTS
+        base_height = start[2]
+        model_prim = stage.GetPrimAtPath(info["prim_path"] + "/model")
+        if not model_prim.IsValid():
+            print(f"WARNING: {name} has no /model child prim - fall rotation will be a no-op for them.")
+        skel_prim, walk_clip_path, fall_clip_path, held_clip_path, fall_clip_duration = get_skeleton_and_clips(model_prim)
+        if skel_prim is None:
+            print(f"WARNING: {name} has no Skeleton under /model - fall animation will be a no-op for them.")
         movers.append({
-            "name": name, "prim": prim, "path": full_path, "start_delay": info["start_delay"],
+            "name": name, "prim": prim, "model_prim": model_prim,
+            "skel_prim": skel_prim, "walk_clip_path": walk_clip_path, "fall_clip_path": fall_clip_path,
+            "held_clip_path": held_clip_path, "fall_clip_duration": fall_clip_duration,
+            "base_height": base_height, "start_delay": info["start_delay"],
             "loiter_start": None, "loiter_duration": None, "loiter_center": None,
+            "loiter_was_active": False, "fall_center": None,
             "paused_until": 0, "fall_start": None, "fall_triggered": False, "fallen": False,
+            "fall_held_triggered": False,
         })
+        # Start invisible and in the static idle pose - see
+        # update_person_position's docstring. They become visible/animated
+        # only for the duration of their own assigned fall/loiter event.
+        UsdGeom.Imageable(prim).MakeInvisible()
+        if skel_prim is not None:
+            set_animation_clip(skel_prim, held_clip_path)
 
     # --- Robot setup ---
-    # The robot runs in REAL PHYSICS mode for the whole session (kinematic
-    # OFF), driven by Nav2 through the confirmed-working velocity_smoother
-    # relay bypass - see NOTES.md. Per prior debugging, the kinematic flag
-    # must be set BEFORE timeline.play() to reliably take effect, so this
-    # happens once here and is never toggled at runtime.
-    robot_state = None
-    robot_base_prim = stage.GetPrimAtPath(ROBOT_BASE_PATH)
-    if robot_base_prim.IsValid() and robot_base_prim.HasAPI(UsdPhysics.RigidBodyAPI):
-        rigid_api = UsdPhysics.RigidBodyAPI(robot_base_prim)
-        attr = rigid_api.GetKinematicEnabledAttr()
-        if attr:
-            attr.Set(False)
-        else:
-            rigid_api.CreateKinematicEnabledAttr(False)
+    # Lightweight custom robot (see create_lightweight_robot) instead of the
+    # old heavy mobile_manipulator_ros asset - no physics to disable, no
+    # visuals to strip down, it was built minimal from the start.
+    robot_base_prim, robot_camera_path = create_lightweight_robot(stage)
+    base_pos = get_translate(robot_base_prim)
 
-        # Write the patrol waypoints out for the WSL-side dispatch_bridge.py
-        # to read, so there's a single source of truth for the patrol route
-        # instead of hardcoding it twice.
-        with open(PATROL_WAYPOINTS_FILE, "w") as f:
-            json.dump({"waypoints": [[x, y] for x, y, _ in ROBOT_WAYPOINTS]}, f, indent=2)
-
-        robot_rigid_prim = RigidPrim(prim_paths_expr=ROBOT_BASE_PATH)
-
-        robot_state = {
-            "prim": robot_base_prim,
-            "rigid_prim": robot_rigid_prim,
-            "last_check": 0,
-            "handled_timestamps": set(),
-        }
-        print(f"Robot found at {ROBOT_BASE_PATH}, set to real physics mode (kinematic off). "
-              f"Patrol waypoints written to {PATROL_WAYPOINTS_FILE} for dispatch_bridge.py.")
-    else:
-        print(f"WARNING: robot base prim not found/valid at {ROBOT_BASE_PATH} - robot dispatch disabled this run.")
+    robot_state = {
+        "prim": robot_base_prim,
+        "camera_path": robot_camera_path,
+        "base_height": base_pos[2],
+        "last_check": 0,
+        "last_move_time": 0,
+        "handled_timestamps": set(),
+        "current_target": None,
+        "current_alert": None,
+        "waypoint_index": 0,
+    }
+    print(f"Lightweight robot ready, moving kinematically at {ROBOT_MOVE_SPEED} m/s, "
+          f"patrolling {len(ROBOT_WAYPOINTS)} waypoints.")
 
     # NOW play the timeline, after all kinematic flags are set - order matters here.
     timeline = omni.timeline.get_timeline_interface()
+
+    # Enable looping for the Mixamo walk-cycle SkelAnimations. Without this
+    # the clip plays through once and holds its final frame (characters
+    # appear to stop walking mid-patrol even though their waypoint
+    # translation - handled separately in update_person_position - keeps
+    # moving them). Loop end is computed from the actual baked animation's
+    # last real time sample rather than assumed, so it wraps exactly on
+    # the clip boundary instead of stuttering mid-stride.
+    anim_loop_seconds = get_animation_loop_seconds(stage, default=1.0)
+    timeline.set_start_time(0.0)
+    timeline.set_end_time(anim_loop_seconds)
+    timeline.set_looping(True)
+    print(f"Animation loop set: 0 -> {anim_loop_seconds:.3f}s, looping enabled.")
+
     timeline.play()
     for _ in range(20):
         simulation_app.update()
@@ -1070,31 +1906,55 @@ def main():
     if FALL_ENABLED and movers:
         faller = random.choice(movers)
         faller["fall_start"] = random.uniform(*FALL_START_RANGE)
-        print(f"*** {faller['name']} will fall (scripted) at t={faller['fall_start']:.1f}s ***")
+        faller["fall_center"] = random.choice(list(ZONE_CENTERS.values()))
+        print(f"*** {faller['name']} will fall (scripted) near {faller['fall_center']} at t={faller['fall_start']:.1f}s ***")
 
     print("=== Unified tracking + movement loop started. Press Ctrl+C to stop. ===")
 
     sim_start = time.time()
     last_sweep_time = 0
-    last_tick_elapsed = 0.0
     authorized_ids_cache = load_authorized_ids()
+
+    # Populate shared _tick_state so _tick() (called both here and from
+    # inside run_subprocess/capture_frame's blocking waits) has everything
+    # it needs to keep movement/robot updates running continuously, even
+    # during multi-second subprocess calls mid-sweep.
+    _tick_state["sim_start"] = sim_start
+    _tick_state["movers"] = movers
+    _tick_state["robot_state"] = robot_state
+    _tick_state["authorized_ids_cache"] = authorized_ids_cache
+
+    # Start the persistent YOLO/DeepFace workers ONCE here, before the main
+    # loop - this is the actual fix for the whole session's "scanning is so
+    # slow" problem. Both scripts' model loading (YOLO weights, RetinaFace +
+    # Facenet) happens exactly once now, not on every single one of the
+    # 5-6 scans per 8-second sweep cycle. wait_ready() blocks (while still
+    # calling _tick() so physics/movement keep going) until each worker
+    # prints "READY", confirming its model finished loading before the
+    # first real scan tries to use it.
+    print("Starting persistent YOLO worker (loading model once)...")
+    _workers["yolo"] = PersistentWorker("yolo_worker.py")
+    if not _workers["yolo"].wait_ready():
+        print("WARNING: YOLO worker did not report ready in time - scans may fail or hang.")
+    else:
+        print("YOLO worker ready.")
+
+    print("Starting persistent DeepFace worker (loading models once)...")
+    _workers["deepface"] = PersistentWorker("deepface_worker.py")
+    if not _workers["deepface"].wait_ready():
+        print("WARNING: DeepFace worker did not report ready in time - scans may fail or hang.")
+    else:
+        print("DeepFace worker ready.")
 
     try:
         while True:
             elapsed = time.time() - sim_start
-            dt = elapsed - last_tick_elapsed
-            last_tick_elapsed = elapsed
 
-            for m in movers:
-                update_person_position(m, elapsed)
-
-            if robot_state is not None:
-                update_robot(robot_state, elapsed, authorized_ids_cache)
-
-            simulation_app.update()
+            _tick()
 
             if elapsed - last_sweep_time >= SCAN_INTERVAL_SECONDS:
                 authorized_ids_cache = load_authorized_ids()
+                _tick_state["authorized_ids_cache"] = authorized_ids_cache
                 run_sweep(camera_zones, authorized_ids_cache, streak_state, movers, elapsed)
                 last_sweep_time = elapsed
 
@@ -1102,6 +1962,14 @@ def main():
         print("\n=== Stopped by user. ===")
     finally:
         timeline.stop()
+        for worker in _workers.values():
+            if worker is not None and worker.proc.poll() is None:
+                try:
+                    worker.proc.stdin.write("__EXIT__\n")
+                    worker.proc.stdin.flush()
+                except Exception:
+                    pass
+                worker.proc.terminate()
 
 
 if __name__ == "__main__":

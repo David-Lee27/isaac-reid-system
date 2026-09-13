@@ -35,6 +35,7 @@ import time
 
 EVENT_LOG_FILE = "/mnt/c/isaacsim/projects/surveillance-proj/event_log.json"
 PATROL_WAYPOINTS_FILE = "/mnt/c/isaacsim/projects/surveillance-proj/robot_patrol_waypoints.json"
+FACE_SEARCH_GOAL_FILE = "/mnt/c/isaacsim/projects/surveillance-proj/robot_face_search_goal.json"
 
 POLL_INTERVAL = 2.0        # seconds between checking for new dispatch alerts
 GOAL_TIMEOUT = 240        # seconds to wait for a nav goal before giving up - generous
@@ -55,8 +56,15 @@ GOAL_STANDOFF_METERS = 3.0
 GOAL_TEMPLATE = (
     "{{pose: {{header: {{frame_id: 'map'}}, "
     "pose: {{position: {{x: {x}, y: {y}, z: 0.0}}, "
-    "orientation: {{w: 1.0}}}}}}}}"
+    "orientation: {{z: {qz}, w: {qw}}}}}}}}}"
 )
+
+
+def yaw_deg_to_quat(yaw_deg):
+    """Pure-yaw (rotation about Z only) quaternion, since the robot never
+    needs to pitch/roll for navigation goals."""
+    half = math.radians(yaw_deg) / 2.0
+    return math.sin(half), math.cos(half)  # (qz, qw)
 
 
 def load_json(path):
@@ -100,7 +108,23 @@ def apply_goal_standoff(x, y):
     return x * scale, y * scale
 
 
-def send_nav_goal(x, y, label):
+def find_face_search_goal(handled_ids):
+    """Checks for a pending face-search sub-goal (a same-location, new-
+    heading 'turn to look this way' request written by unified_tracking.py
+    while the robot is actively hunting for a usable face at a dispatch
+    location). Checked with the HIGHEST priority in the main loop - while a
+    search is in progress we want the robot committed to it, not wandering
+    back to patrol or accepting a newer, unrelated dispatch alert mid-turn.
+    """
+    data = load_json(FACE_SEARCH_GOAL_FILE)
+    if not data:
+        return None
+    if data.get("request_id") in handled_ids:
+        return None
+    return data
+
+
+def send_nav_goal(x, y, label, yaw_deg=0.0):
     """Blocks until Nav2 reports success/failure or GOAL_TIMEOUT is hit.
     Uses the plain `ros2 action send_goal` CLI (synchronous, blocks until
     the action completes) rather than rclpy, since it's already confirmed
@@ -111,7 +135,8 @@ def send_nav_goal(x, y, label):
     turned out to be the actual common case - see NOTES.md) were silently
     reported as successes. Now explicitly checks the real result status.
     """
-    goal_str = GOAL_TEMPLATE.format(x=x, y=y)
+    qz, qw = yaw_deg_to_quat(yaw_deg)
+    goal_str = GOAL_TEMPLATE.format(x=x, y=y, qz=qz, qw=qw)
     cmd = (
         f"ros2 action send_goal /navigate_to_pose "
         f"nav2_msgs/action/NavigateToPose \"{goal_str}\""
@@ -151,6 +176,7 @@ def send_nav_goal(x, y, label):
 
 def main():
     handled_timestamps = set()
+    handled_search_ids = set()
     patrol_index = 0
 
     print("=== dispatch_bridge.py running. Watching for dispatch alerts. ===")
@@ -159,6 +185,17 @@ def main():
 
     try:
         while True:
+            # Highest priority: an in-progress face search. Same X/Y as
+            # wherever the robot already is, just a new heading to try.
+            search_goal = find_face_search_goal(handled_search_ids)
+            if search_goal:
+                x, y = search_goal["x"], search_goal["y"]
+                yaw = search_goal.get("yaw_deg", 0.0)
+                label = f"FACE SEARCH: heading {yaw:.0f} deg"
+                send_nav_goal(x, y, label, yaw_deg=yaw)
+                handled_search_ids.add(search_goal["request_id"])
+                continue
+
             alert = find_next_alert(handled_timestamps)
 
             if alert:
@@ -178,7 +215,17 @@ def main():
 
             waypoints = load_patrol_waypoints()
             if waypoints:
-                x, y = waypoints[patrol_index % len(waypoints)]
+                raw_x, raw_y = waypoints[patrol_index % len(waypoints)]
+                # Same standoff treatment as dispatch alerts above -
+                # ROBOT_WAYPOINTS in unified_tracking.py were never run
+                # through this, and at least one of them ((-20, 0)) turned
+                # out to sit too close to a pillar, causing the robot to
+                # wedge against it and jitter in place on its very first
+                # patrol leg instead of actually navigating.
+                x, y = apply_goal_standoff(raw_x, raw_y)
+                if (x, y) != (raw_x, raw_y):
+                    print(f"[dispatch_bridge] pulling patrol waypoint in from wall: "
+                          f"({raw_x}, {raw_y}) -> ({x:.2f}, {y:.2f})")
                 send_nav_goal(x, y, f"patrol waypoint {patrol_index % len(waypoints)}")
                 patrol_index += 1
             else:

@@ -41,7 +41,7 @@ amcl:
 bt_navigator:
   ros__parameters:
     global_frame: map
-    robot_base_frame: base_link
+    robot_base_frame: base_footprint
     odom_topic: /odom
     bt_loop_duration: 10
     default_server_timeout: 20
@@ -99,18 +99,18 @@ controller_server:
       time_steps: 56
       model_dt: 0.05
       batch_size: 2000
-      ax_max: 3.0
-      ax_min: -3.0
-      ay_max: 3.0
-      ay_min: -3.0
-      az_max: 3.5
+      ax_max: 6.0
+      ax_min: -6.0
+      ay_max: 6.0
+      ay_min: -6.0
+      az_max: 5.0
       vx_std: 0.2
       vy_std: 0.2
       wz_std: 0.4
-      vx_max: 1.2
-      vx_min: -0.6
-      vy_max: 1.2
-      wz_max: 2.5
+      vx_max: 10.0
+      vx_min: -5.0
+      vy_max: 10.0
+      wz_max: 6.0
       iteration_count: 1
       prune_distance: 1.7
       transform_tolerance: 0.1
@@ -191,7 +191,7 @@ local_costmap:
       update_frequency: 5.0
       publish_frequency: 2.0
       global_frame: odom
-      robot_base_frame: base_link
+      robot_base_frame: base_footprint
       rolling_window: true
       width: 3
       height: 3
@@ -243,7 +243,7 @@ global_costmap:
       update_frequency: 1.0
       publish_frequency: 1.0
       global_frame: map
-      robot_base_frame: base_link
+      robot_base_frame: base_footprint
       robot_radius: 0.22
       resolution: 0.05
       track_unknown_space: true
@@ -335,7 +335,7 @@ behavior_server:
       plugin: "nav2_behaviors::AssistedTeleop"
     local_frame: odom
     global_frame: map
-    robot_base_frame: base_link
+    robot_base_frame: base_footprint
     transform_tolerance: 0.1
     simulate_ahead_time: 2.0
     max_rotational_vel: 1.0
@@ -382,10 +382,10 @@ velocity_smoother:
     stamp_smoothed_velocity_with_smoothing_time: False
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [1.2, 0.0, 2.5]
-    min_velocity: [-0.6, 0.0, -2.5]
-    max_accel: [3.0, 0.0, 3.5]
-    max_decel: [-3.0, 0.0, -3.5]
+    max_velocity: [10.0, 0.0, 6.0]
+    min_velocity: [-5.0, 0.0, -6.0]
+    max_accel: [15.0, 0.0, 8.0]
+    max_decel: [-15.0, 0.0, -8.0]
     odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
@@ -437,7 +437,7 @@ docking_server:
     undock_linear_tolerance: 0.05
     undock_angular_tolerance: 0.1
     max_retries: 3
-    base_frame: "base_link"
+    base_frame: "base_footprint"
     fixed_frame: "odom"
     dock_backwards: false
     dock_prestaging_tolerance: 0.5
