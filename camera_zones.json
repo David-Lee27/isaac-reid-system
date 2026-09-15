@@ -1,6 +1,6 @@
 {
-  "/World/Camera1": "RoomA_Cam1",
-  "/World/Camera2": "RoomA_Cam2",
-  "/World/Camera3": "RoomB_Cam3",
-  "/World/Camera4": "RoomB_Cam4"
+  "/World/Camera1": "RoomA_Cam2",
+  "/World/Camera2": "RoomA_Cam1",
+  "/World/Camera3": "RoomB_Cam4",
+  "/World/Camera4": "RoomB_Cam3"
 }

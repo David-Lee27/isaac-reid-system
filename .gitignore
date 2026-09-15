@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.pyc
 
@@ -11,3 +11,20 @@ __pycache__/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Large raw scene assets (source FBX exports + textures) - not needed to run/review the code
+assets/*.fbx
+assets/*.fbm/
+assets/textures/
+assets/props/
+*.usd
+
+# Debug/diagnostic output - regenerated on every run, not meaningful without the live sim
+debug_captures/
+nav_stack_logs/
+zone_log.json
+checkpoint_log.json
+
+# Stray backup/unused files
+nav2_params.yamlA
+_unused_run_sim_filtered.bat.txt

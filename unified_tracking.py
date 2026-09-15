@@ -85,7 +85,7 @@ FALL_PAUSE_DURATION = 45  # seconds
 # camera's aspect-ratio fall heuristic to detect, instead of that heuristic
 # only ever firing on incidental noise from a person who's still standing.
 FALL_ENABLED = True
-FALL_START_RANGE = (15, 55)       # seconds into the run it can happen
+FALL_START_RANGE = (8, 20)       # shortened from (15,55) so something visibly happens within the first ~20s of a demo instead of possibly waiting a minute
 FALL_ROTATION_OPTIONS = [(90, 0, 0), (-90, 0, 0), (0, 90, 0), (0, -90, 0)]  # random fall direction, degrees
 
 # --- Randomized loitering test ---
@@ -93,20 +93,121 @@ FALL_ROTATION_OPTIONS = [(90, 0, 0), (-90, 0, 0), (0, 90, 0), (0, -90, 0)]  # ra
 # instead of patrolling, they wander in small circles near a random zone -
 # a realistic test of the loitering detector instead of manually posing someone.
 LOITER_ENABLED = True
-LOITER_START_RANGE = (20, 50)      # seconds into the run it can begin
+LOITER_START_RANGE = (8, 20)       # shortened from (20,50), same reason as FALL_START_RANGE
 LOITER_DURATION_RANGE = (25, 40)   # how long they wander before resuming patrol
-LOITER_RADIUS = 2.0                # meters, how far they wander from the center point
+LOITER_RADIUS = 2.0                # kept for backward compat / reference, no longer drives the wander shape - see the room-box random-waypoint wander below
 
-# Zone camera positions, reused as loiter/fall centers - real coordinates
-# from optimized room.usd (see diagnose_new_scene_cameras.py output), NOT
-# guessed. Room A = Camera1/Camera2 (the room with the people, per direct
-# observation of the scene), Room B = Camera3/Camera4.
+# Zone camera positions used DIRECTLY as fall/loiter event locations - a
+# security camera's actual field of view is centered near where it's
+# mounted, so nudging the event location away from that (an earlier
+# attempt, done purely to keep the robot's orbit search off the walls)
+# was almost certainly why detections stopped happening entirely - the
+# events were probably landing outside what the camera could actually see.
+# Robot orbit safety near walls/corners is now handled separately by
+# clamping orbit standpoints to FLOOR_BOUNDS (see search_for_face) instead
+# of moving the event itself.
 ZONE_CENTERS = {
     "RoomA_Cam1": (22.60, 27.36),
     "RoomA_Cam2": (39.21, 9.00),
     "RoomB_Cam3": (21.64, 8.91),
     "RoomB_Cam4": (5.83, 27.40),
 }
+DOORWAY_CENTER = (22, 17.5)  # your directly-observed value (close to the earlier computed 22.1,18.12 - using yours since you watched it directly)
+
+# Room bounding boxes, from corners you gave directly by watching the scene
+# (more trustworthy than anything computed from camera position alone) -
+# used below for genuine randomized wandering within each room during a
+# loitering event, instead of tracing a small fixed circle (which is what
+# looked like "just walking the perimeter").
+ROOM_BOUNDS = {
+    "west": (5.0, 21.5, 9.0, 27.0),   # (xmin, xmax, ymin, ymax) - corners (5,9),(6,27),(21.5,27),(21,9)
+    "east": (22.0, 39.0, 9.0, 26.0),  # corners (22,9),(39,9),(39,26), doorway (22,17.5)
+}
+
+# Real overall floor bounds (from diagnose_room_bounds.py: x:[4.93,39.93],
+# y:[8.29,28.29]), with a small safety margin. Used as a HARD CLAMP - no
+# matter what upstream logic (fall_center, loiter wander, robot chase
+# tracking) computed a coordinate, nothing can ever actually place a
+# person or the robot outside the real building. This exists because a
+# fallen character was observed clearly outside the walls with no code
+# path in this file that should currently be able to produce that -
+# rather than keep guessing at which stale/cached code path did it, this
+# makes it structurally impossible regardless of cause.
+FLOOR_BOUNDS = (5.5, 39.4, 8.8, 27.8)  # (xmin, xmax, ymin, ymax)
+
+
+def clamp_to_floor(x, y):
+    xmin, xmax, ymin, ymax = FLOOR_BOUNDS
+    return (max(xmin, min(xmax, x)), max(ymin, min(ymax, y)))
+
+
+# The dividing wall between the two rooms is two solid segments (measured
+# via diagnose_room_bounds.py: Cube at x:[22.00,22.20] y:[8.12,16.12], and
+# Cube_01 at x:[22.00,22.20] y:[20.12,28.12]) with a walkable doorway gap
+# between y=16.12 and y=20.12. Since movement here is purely kinematic (we
+# teleport prims directly - there's no PhysX simulation driving anything,
+# so a collider alone would do nothing; PhysX only pushes back DYNAMIC
+# bodies on contact, not something being repositioned by hand every
+# frame), this is a real software wall-check using the actual measured
+# wall geometry, not a decorative collider.
+DIVIDER_X_RANGE = (21.7, 22.4)     # small margin either side of the real 22.00-22.20 wall
+DOORWAY_Y_RANGE = (15.8, 20.4)     # small margin either side of the real 16.12-20.12 gap
+
+
+def blocked_by_divider(x, y):
+    """True if (x, y) is inside the solid part of the dividing wall (i.e.
+    NOT in the doorway gap)."""
+    xmin, xmax = DIVIDER_X_RANGE
+    if not (xmin <= x <= xmax):
+        return False
+    ymin, ymax = DOORWAY_Y_RANGE
+    return not (ymin <= y <= ymax)
+
+
+def move_with_wall_check(cur_x, cur_y, new_x, new_y):
+    """Real wall-collision enforcement for kinematic movement: if the
+    straight-line step from (cur_x, cur_y) to (new_x, new_y) would end up
+    inside the solid dividing wall, the crossing axis (x) gets clamped back
+    to whichever side of the wall the mover was already on, instead of
+    just letting them phase straight through it - which is exactly what
+    was happening when a chase target on the other side of the building
+    pulled a straight kinematic line right through the middle wall.
+    """
+    if not blocked_by_divider(new_x, new_y):
+        return new_x, new_y
+    xmin, xmax = DIVIDER_X_RANGE
+    if cur_x <= xmin:
+        return min(new_x, xmin), new_y
+    else:
+        return max(new_x, xmax), new_y
+
+
+DOORWAY_WAYPOINT = (22.1, sum(DOORWAY_Y_RANGE) / 2.0)  # center of the actual gap
+
+
+def get_next_hop(cur_x, cur_y, target_x, target_y):
+    """REAL fix for the robot getting stuck pressed against the dividing
+    wall: move_with_wall_check correctly BLOCKS illegal crossings, but on
+    its own that just leaves the mover stuck at the wall forever if the
+    final target is on the other side and the current y isn't already
+    inside the doorway band - confirmed exactly in a log where the robot
+    sat frozen at x=21.70 for 15+ seconds trying to reach x=39.
+
+    This is real obstacle-avoidance routing, not just collision blocking:
+    if the current position and the target are on opposite sides of the
+    dividing wall AND the current y isn't already within the doorway gap,
+    the immediate movement target becomes the doorway waypoint first -
+    once through it, the direct line to the real target no longer needs to
+    cross the wall at all.
+    """
+    dxmin, dxmax = DIVIDER_X_RANGE
+    cur_side = "west" if cur_x <= dxmin else ("east" if cur_x >= dxmax else "mid")
+    target_side = "west" if target_x < dxmin else ("east" if target_x > dxmax else "mid")
+    if cur_side != "mid" and target_side != "mid" and cur_side != target_side:
+        ymin, ymax = DOORWAY_Y_RANGE
+        if not (ymin <= cur_y <= ymax):
+            return DOORWAY_WAYPOINT
+    return (target_x, target_y)
 
 # --- Robot dispatch ---
 # The robot patrols on its own loop by default. Periodically it checks the
@@ -146,10 +247,19 @@ FACE_SEARCH_YAW_STEPS = 8              # full circle in 45-degree increments
 FACE_SEARCH_YAW_TOLERANCE_DEG = 8.0    # how close to the target heading counts as "turned"
 FACE_SEARCH_YAW_WAIT_TIMEOUT = 20.0    # seconds to wait for a single turn before giving up on it
 
-# Robot patrols the 4 real zone-camera positions in this scene (reusing
-# ZONE_CENTERS - no reason to invent separate patrol points when the
-# actual points of interest ARE the camera zones).
-ROBOT_WAYPOINTS = [(x, y, 0) for x, y in ZONE_CENTERS.values()]
+# Robot patrols the actual room corners/doorway you gave directly, looping
+# west room -> doorway -> east room -> doorway.
+ROBOT_WAYPOINTS = [
+    (5, 9, 0),
+    (6, 27, 0),
+    (21.5, 27, 0),
+    (22, 17.5, 0),   # doorway
+    (21, 9, 0),
+    (22, 9, 0),
+    (39, 9, 0),
+    (39, 26, 0),
+    (22, 17.5, 0),   # doorway, loop back
+]
 
 # --- SIMPLIFIED KINEMATIC ROBOT MOVEMENT (replaces real Nav2/PhysX driving) ---
 # Real wheel physics through Nav2 turned out not to be worth the cost for
@@ -720,6 +830,8 @@ def update_person_position(mover, elapsed):
         # happens somewhere detectable, exactly like loiter_center already
         # does for the loitering test below.
         fx, fy = mover.get("fall_center", (None, None))
+        if fx is not None:
+            fx, fy = clamp_to_floor(fx, fy)
         # The fall clip's own root translation is intentionally zeroed (see
         # fix_fall_translation_and_hold.py - it used a totally different
         # unit/axis convention than the walk clip and caused floating/wrong
@@ -742,8 +854,11 @@ def update_person_position(mover, elapsed):
     if elapsed < mover.get("paused_until", 0):
         return
 
-    # If this mover is in their assigned loiter window, wander in small
-    # circles near the loiter center instead of following the patrol path.
+    # If this mover is in their assigned loiter window, wander RANDOMLY
+    # within the actual room box they're in (see ROOM_BOUNDS) - picking a
+    # new random point inside the room and walking to it, repeatedly - not
+    # tracing a small fixed circle around one spot, which is what looked
+    # like "just walking the perimeter."
     loiter_start = mover.get("loiter_start")
     if loiter_start is not None:
         loiter_end = loiter_start + mover["loiter_duration"]
@@ -752,16 +867,40 @@ def update_person_position(mover, elapsed):
                 mover["loiter_was_active"] = True
                 UsdGeom.Imageable(mover["prim"]).MakeVisible()
                 set_animation_clip(mover["skel_prim"], mover["walk_clip_path"])
-            cx, cy = mover["loiter_center"]
-            x = cx + LOITER_RADIUS * math.sin(elapsed * 0.35)
-            y = cy + LOITER_RADIUS * math.cos(elapsed * 0.25)
-            z = mover.get("base_height", 0.0)
-            set_translate(mover["prim"], (x, y, z))
+                cx, cy = mover["loiter_center"]
+                mover["loiter_bounds"] = (ROOM_BOUNDS["west"] if cx < 21.75 else ROOM_BOUNDS["east"])
+                mover["loiter_waypoint"] = None
+                mover["last_loiter_move_time"] = elapsed
+
+            xmin, xmax, ymin, ymax = mover["loiter_bounds"]
+            if mover.get("loiter_waypoint") is None:
+                # 1m margin so wander targets don't sit literally against a wall
+                mover["loiter_waypoint"] = (random.uniform(xmin + 1, xmax - 1), random.uniform(ymin + 1, ymax - 1))
+
+            pos = get_translate(mover["prim"])
+            tx, ty = mover["loiter_waypoint"]
+            dx, dy = tx - pos[0], ty - pos[1]
+            dist = math.hypot(dx, dy)
+            dt = elapsed - mover.get("last_loiter_move_time", elapsed)
+            mover["last_loiter_move_time"] = elapsed
+            LOITER_WALK_SPEED = 1.0  # m/s - an unhurried wandering pace, not a purposeful walk
+
+            if dist < 0.3:
+                mover["loiter_waypoint"] = None  # arrived - a new random point gets picked next tick
+            else:
+                step = min(LOITER_WALK_SPEED * dt, dist)
+                raw_x = pos[0] + dx / dist * step
+                raw_y = pos[1] + dy / dist * step
+                nx, ny = move_with_wall_check(pos[0], pos[1], raw_x, raw_y)
+                yaw_deg = math.degrees(math.atan2(dx, -dy))
+                set_rotation(mover["prim"], (0.0, 0.0, yaw_deg))
+                set_translate(mover["prim"], (nx, ny, mover.get("base_height", 0.0)))
             return
         elif mover.get("loiter_was_active"):
             # Loiter window just ended - go back to idle/invisible, same
             # as after a fall recovers.
             mover["loiter_was_active"] = False
+            mover["loiter_waypoint"] = None
             set_animation_clip(mover["skel_prim"], mover["held_clip_path"])
             UsdGeom.Imageable(mover["prim"]).MakeInvisible()
 
@@ -790,7 +929,7 @@ def get_nearest_mover_coords(movers, zone_name):
         (get_translate(m["prim"])[1] - zone_pos[1]) ** 2
     ))
     npos = get_translate(nearest["prim"])
-    return (npos[0], npos[1])
+    return clamp_to_floor(npos[0], npos[1])
 
 
 def pause_nearest_mover(movers, zone_name, elapsed):
@@ -968,7 +1107,7 @@ def search_for_face(robot_state, alert, authorized_ids):
     file's movement), no physics, no Nav2, instant and reliable by
     construction.
     """
-    ORBIT_RADIUS = 4.0       # meters from the target to stand at each standpoint - bumped from 2.0, which was putting the robot's camera almost inside the person (confirmed via saved debug frames: point-blank on their shoes)
+    ORBIT_RADIUS = 2.5       # meters - shrunk from 4.0: several zone centers are close enough to walls/corners that a 4m orbit sent standpoints straight outside the building (confirmed via diagnose_room_bounds.py - real floor is only ~35x20m and zones sit near corners)
     ORBIT_STANDPOINTS = 6    # trimmed from 8 - fewer forced-render sequences per search now that the target is actually frozen and correctly aimed at
 
     center = alert["coords"]
@@ -977,9 +1116,15 @@ def search_for_face(robot_state, alert, authorized_ids):
 
     for step in range(ORBIT_STANDPOINTS):
         angle = (2 * math.pi / ORBIT_STANDPOINTS) * step
-        standpoint = (center[0] + ORBIT_RADIUS * math.sin(angle),
-                      center[1] + ORBIT_RADIUS * math.cos(angle),
-                      robot_state["base_height"])
+        raw_x = center[0] + ORBIT_RADIUS * math.sin(angle)
+        raw_y = center[1] + ORBIT_RADIUS * math.cos(angle)
+        # Clamp each standpoint to the real floor bounds - zone centers are
+        # back to being the actual camera positions (near walls/corners),
+        # so some orbit standpoints would otherwise land outside the
+        # building again. This keeps the robot physically inside no matter
+        # what, even if it means a slightly squashed orbit near a corner.
+        sx, sy = clamp_to_floor(raw_x, raw_y)
+        standpoint = (sx, sy, robot_state["base_height"])
         # Face the CENTER (the person). Now that the camera is our own
         # SimpleRobot asset (see create_lightweight_robot), it was mounted
         # specifically to match the SAME body-forward convention used
@@ -1158,13 +1303,11 @@ def update_robot(robot_state, elapsed, authorized_ids):
         movers = _tick_state.get("movers", [])
         if len(movers) == 1:
             live_pos = get_translate(movers[0]["prim"])
-            robot_state["current_target"] = (live_pos[0], live_pos[1])
+            robot_state["current_target"] = clamp_to_floor(live_pos[0], live_pos[1])
 
     pos = get_translate(robot_state["prim"])
     tx, ty = robot_state["current_target"]
-    dx = tx - pos[0]
-    dy = ty - pos[1]
-    dist = math.hypot(dx, dy)
+    dist = math.hypot(tx - pos[0], ty - pos[1])  # arrival check is always against the REAL final target, never the doorway hop below
 
     if dist <= ARRIVAL_RADIUS:
         alert = robot_state.get("current_alert")
@@ -1220,17 +1363,26 @@ def update_robot(robot_state, elapsed, authorized_ids):
             robot_state["waypoint_index"] = (robot_state["waypoint_index"] + 1) % len(ROBOT_WAYPOINTS)
         return
 
-    # Move toward the target at ROBOT_MOVE_SPEED, capped so a big dt (e.g.
-    # right after a long blocking sweep call) can't overshoot past the
-    # target and start oscillating.
-    step_dist = min(ROBOT_MOVE_SPEED * dt, dist)
-    if dist > 0:
-        new_world_pos = (pos[0] + dx / dist * step_dist, pos[1] + dy / dist * step_dist, robot_state["base_height"])
+    # Move toward the NEXT HOP (doorway detour if crossing rooms, else the
+    # real target directly - see get_next_hop) at ROBOT_MOVE_SPEED, capped
+    # so a big dt (e.g. right after a long blocking sweep call) can't
+    # overshoot past it and start oscillating.
+    hop_x, hop_y = get_next_hop(pos[0], pos[1], tx, ty)
+    dx = hop_x - pos[0]
+    dy = hop_y - pos[1]
+    hop_dist = math.hypot(dx, dy)
+    step_dist = min(ROBOT_MOVE_SPEED * dt, hop_dist)
+    if hop_dist > 0:
+        raw_x = pos[0] + dx / hop_dist * step_dist
+        raw_y = pos[1] + dy / hop_dist * step_dist
+        new_x, new_y = move_with_wall_check(pos[0], pos[1], raw_x, raw_y)  # real wall-collision enforcement, not decorative - see move_with_wall_check's comment
+        new_world_pos = (new_x, new_y, robot_state["base_height"])
         yaw_deg = math.degrees(math.atan2(dx, -dy))  # same forward-axis convention as update_person_position
         set_rotation(robot_state["prim"], (0.0, 0.0, yaw_deg))
         set_world_translate(robot_state["prim"], new_world_pos)  # NOT set_translate() - see set_world_translate()'s comment for why
 
-    if int(elapsed) % 3 == 0 and dt > 0:  # throttled print, same cadence feel as the old version
+    if elapsed - robot_state.get("last_move_print", -999) >= 3.0 and dt > 0:
+        robot_state["last_move_print"] = elapsed
         print(f"  [ROBOT] moving: at ({pos[0]:.2f}, {pos[1]:.2f}), "
               f"target ({tx:.2f}, {ty:.2f}), dist={dist:.2f}m")
 
@@ -1577,11 +1729,22 @@ def scan_zone_camera(camera_path, zone_name, movers):
     neither of those changed.
     """
     print(f"  scanning {zone_name}...")
-    bgr = capture_frame(camera_path, resolution=(160, 120))
+    bgr = capture_frame(camera_path, resolution=(640, 480))  # bumped from 160x120 - confirmed via saved debug frames that a person across a ~35m room was only a few blurry pixels tall at that resolution, undetectable by YOLO regardless of whether they were in frame. DeepFace (the actually expensive part) is no longer run on zone cameras, so a much higher YOLO-only resolution is cheap by comparison.
     if bgr is None:
         return None
 
     tag = zone_name.replace(" ", "_")
+
+    # ALWAYS save the raw frame, regardless of whether anyone gets detected
+    # - this is the actual visibility gap that made "why isn't the camera
+    # finding anything" impossible to diagnose: the old code only ever
+    # saved a debug image AFTER a detection already succeeded, so a camera
+    # that detects NOTHING left zero visual evidence behind to check
+    # against. Now every single scan leaves a real frame in debug_captures
+    # to look at, success or failure.
+    raw_debug_name = f"{datetime.now().strftime('%H%M%S')}_{tag}_RAWFRAME.jpg"
+    cv2.imwrite(os.path.join(DEBUG_DIR, raw_debug_name), bgr)
+
     frame_path = os.path.join(os.environ["TEMP"], f"scan_{tag}.jpg")
     cv2.imwrite(frame_path, bgr)
 
@@ -1758,6 +1921,19 @@ def main():
         shutil.rmtree(DEBUG_DIR)
     os.makedirs(DEBUG_DIR, exist_ok=True)
 
+    # REAL FIX for "why is it chasing (28.67, 28.73) / Zone_A_NorthEast /
+    # unauthorized_zone_presence" - none of that exists anywhere in this
+    # file anymore. event_log.json was never cleared between runs - it just
+    # accumulates forever across every session, including ones from way
+    # before this room/scene even existed. Every fresh run resets
+    # handled_timestamps to empty, so find_next_unhandled_alert() happily
+    # re-served every ancient unhandled dispatch_alert ever written to that
+    # file, from any past session, as if it were brand new. Wiping it at
+    # the start of every run is the actual fix - old alerts from a
+    # previous run have no business being acted on in a new one anyway.
+    with open(EVENT_LOG_FILE, "w") as f:
+        json.dump([], f)
+
     with open(CAMERA_ZONES_FILE, "r") as f:
         camera_zones = json.load(f)
 
@@ -1819,7 +1995,7 @@ def main():
     print(f"  Adjusted {lights_adjusted} light prim(s) to intensity 2.0 for flatter/cheaper lighting.")
 
     movers = []
-    for name, info in PEOPLE.items():
+    for i, (name, info) in enumerate(PEOPLE.items()):
         prim = stage.GetPrimAtPath(info["prim_path"])
         if not prim.IsValid():
             print(f"WARNING: {name} prim not found at {info['prim_path']} - skipping")
@@ -1827,6 +2003,16 @@ def main():
         disable_physics_recursive(prim)
         start = get_translate(prim)
         base_height = start[2]
+        # Force spawn position into a REAL room box, alternating west/east,
+        # instead of trusting whatever position happens to be authored in
+        # the USD file - per explicit direction, people should only ever
+        # occupy the actual room coordinates, never wherever they happened
+        # to be placed in the scene file (they're invisible at this point
+        # anyway, but this guarantees it's never wrong if anything ever
+        # makes them visible unexpectedly).
+        room = ROOM_BOUNDS["west"] if i % 2 == 0 else ROOM_BOUNDS["east"]
+        spawn_x, spawn_y = random.uniform(room[0] + 1, room[1] - 1), random.uniform(room[2] + 1, room[3] - 1)
+        set_translate(prim, (spawn_x, spawn_y, base_height))
         model_prim = stage.GetPrimAtPath(info["prim_path"] + "/model")
         if not model_prim.IsValid():
             print(f"WARNING: {name} has no /model child prim - fall rotation will be a no-op for them.")
@@ -1871,6 +2057,23 @@ def main():
     print(f"Lightweight robot ready, moving kinematically at {ROBOT_MOVE_SPEED} m/s, "
           f"patrolling {len(ROBOT_WAYPOINTS)} waypoints.")
 
+    # Switch the viewport from "Stage Lights" to "Camera Light" - confirmed
+    # real API (not guessed) from an NVIDIA forum answer: the viewport menu
+    # bar's lighting dropdown is driven by omni.kit.actions.core actions,
+    # not a plain carb setting. "Camera Light" keeps whatever you're looking
+    # through lit from the camera's own position, which matters here since
+    # this scene's only real light is one dome light - stage-lit corners far
+    # from it can otherwise render too dark to see clearly.
+    try:
+        import omni.kit.actions.core as _actions_core  # aliased on purpose - a bare "import omni.kit.actions.core" here rebinds the name "omni" as LOCAL to this whole function (Python function-scoping quirk), which broke the earlier omni.usd.get_context() call above with an UnboundLocalError
+        action_registry = _actions_core.get_action_registry()
+        action = action_registry.get_action("omni.kit.viewport.menubar.lighting", "set_lighting_mode_camera")
+        action.execute()
+        print("Viewport lighting mode set to Camera Light.")
+    except Exception as e:
+        print(f"Could not set viewport lighting mode to Camera Light ({e}) - "
+              f"you can switch it manually via the lamp icon in the viewport menu bar.")
+
     # NOW play the timeline, after all kinematic flags are set - order matters here.
     timeline = omni.timeline.get_timeline_interface()
 
@@ -1895,22 +2098,6 @@ def main():
     # whole run - see check_loitering() for why this replaced a log-based check.
     streak_state = {zone_name: {"streak": 0, "alerted": False} for zone_name in camera_zones.values()}
 
-    if LOITER_ENABLED and movers:
-        loiterer = random.choice(movers)
-        loiterer["loiter_start"] = random.uniform(*LOITER_START_RANGE)
-        loiterer["loiter_duration"] = random.uniform(*LOITER_DURATION_RANGE)
-        loiterer["loiter_center"] = random.choice(list(ZONE_CENTERS.values()))
-        print(f"*** {loiterer['name']} will loiter near {loiterer['loiter_center']} "
-              f"starting at t={loiterer['loiter_start']:.1f}s for {loiterer['loiter_duration']:.1f}s ***")
-
-    if FALL_ENABLED and movers:
-        faller = random.choice(movers)
-        faller["fall_start"] = random.uniform(*FALL_START_RANGE)
-        faller["fall_center"] = random.choice(list(ZONE_CENTERS.values()))
-        print(f"*** {faller['name']} will fall (scripted) near {faller['fall_center']} at t={faller['fall_start']:.1f}s ***")
-
-    print("=== Unified tracking + movement loop started. Press Ctrl+C to stop. ===")
-
     sim_start = time.time()
     last_sweep_time = 0
     authorized_ids_cache = load_authorized_ids()
@@ -1925,13 +2112,9 @@ def main():
     _tick_state["authorized_ids_cache"] = authorized_ids_cache
 
     # Start the persistent YOLO/DeepFace workers ONCE here, before the main
-    # loop - this is the actual fix for the whole session's "scanning is so
-    # slow" problem. Both scripts' model loading (YOLO weights, RetinaFace +
-    # Facenet) happens exactly once now, not on every single one of the
-    # 5-6 scans per 8-second sweep cycle. wait_ready() blocks (while still
-    # calling _tick() so physics/movement keep going) until each worker
-    # prints "READY", confirming its model finished loading before the
-    # first real scan tries to use it.
+    # loop. Both scripts' model loading happens exactly once now, not on
+    # every single scan. wait_ready() blocks (while still calling _tick() so
+    # physics/movement keep going) until each worker prints "READY".
     print("Starting persistent YOLO worker (loading model once)...")
     _workers["yolo"] = PersistentWorker("yolo_worker.py")
     if not _workers["yolo"].wait_ready():
@@ -1945,6 +2128,32 @@ def main():
         print("WARNING: DeepFace worker did not report ready in time - scans may fail or hang.")
     else:
         print("DeepFace worker ready.")
+
+    # REAL FIX for "I never saw anyone become visible": FALL_START_RANGE/
+    # LOITER_START_RANGE used to count from raw sim start, but the YOLO/
+    # DeepFace workers above can easily take 15-40+ real seconds to finish
+    # loading models - the entire fall-and-recover or loiter-and-end cycle
+    # could happen, invisibly, before you ever get a chance to actually
+    # look at a running window. Rebasing both to count from THIS point
+    # (workers confirmed ready) instead, so the timer only starts once
+    # there's actually something worth watching on screen.
+    ready_elapsed = time.time() - sim_start
+
+    if LOITER_ENABLED and movers:
+        loiterer = random.choice(movers)
+        loiterer["loiter_start"] = ready_elapsed + random.uniform(*LOITER_START_RANGE)
+        loiterer["loiter_duration"] = random.uniform(*LOITER_DURATION_RANGE)
+        loiterer["loiter_center"] = random.choice(list(ZONE_CENTERS.values()))
+        print(f"*** {loiterer['name']} will loiter near {loiterer['loiter_center']} "
+              f"starting at t={loiterer['loiter_start']:.1f}s for {loiterer['loiter_duration']:.1f}s ***")
+
+    if FALL_ENABLED and movers:
+        faller = random.choice(movers)
+        faller["fall_start"] = ready_elapsed + random.uniform(*FALL_START_RANGE)
+        faller["fall_center"] = random.choice(list(ZONE_CENTERS.values()))
+        print(f"*** {faller['name']} will fall (scripted) near {faller['fall_center']} at t={faller['fall_start']:.1f}s ***")
+
+    print("=== Unified tracking + movement loop started. Press Ctrl+C to stop. ===")
 
     try:
         while True:

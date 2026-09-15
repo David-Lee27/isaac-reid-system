@@ -1144,3 +1144,58 @@ for:
   ROS2 publishers in Isaac Sim's bridge may be tied to render events rather
   than pure physics steps, which would mean this needs tuning rather than
   a full revert.
+
+## ADDED: diagnose_cam3_cam4_mismatch.py - empirical test for the Cam3/Cam4 zone mismatch
+
+Written to answer the open Cam3/Cam4 bug definitively instead of guessing:
+places a bright magenta marker cube at each zone's own ZONE_CENTERS
+coordinate (one at a time), captures ALL 4 real cameras for each
+placement, and scores magenta-pixel presence per frame automatically
+(plus saves every labeled frame to `debug_captures/cam_mismatch/` for a
+visual double-check). Prints a SUMMARY table: for each zone, which camera
+actually saw its own marker vs. which camera `camera_zones.json` currently
+says owns that zone. Also independently prints each camera's raw world
+position + computed forward vector as a second check, in case a camera's
+orientation (not the mapping) turns out to be the real issue.
+
+**Not yet run.** Next step: run it and read the SUMMARY block - a
+mismatch there is the direct confirmation needed before touching
+`camera_zones.json`.
+
+## CONFIRMED (diagnose_cam3_cam4_mismatch.py run): NOT a Cam3/Cam4-only swap - both room pairs were swapped, and Camera2 is unconfirmed/possibly broken
+
+Actual run results (magenta-marker test, headless):
+- Marker at RoomA_Cam1's coord (22.60, 27.36): seen by **nobody** - 0 magenta pixels on all 4 cameras.
+- Marker at RoomA_Cam2's coord (39.21, 9.00): seen by **Camera1** (63 px), not Camera2.
+- Marker at RoomB_Cam3's coord (21.64, 8.91): seen by **Camera4** (63 px), not Camera3.
+- Marker at RoomB_Cam4's coord (5.83, 27.40): seen by **Camera3** (66 px), not Camera4.
+
+Pattern: each camera actually watches the diagonally-opposite corner
+within its OWN room, not its own mount point - Camera1 watches Camera2's
+corner and vice versa (RoomA), Camera3 watches Camera4's corner and vice
+versa (RoomB). This isn't a simple "Cam3/Cam4 swapped" bug as originally
+suspected from the Person2-fall symptom - both room pairs were wrong.
+
+**Fix applied:** `camera_zones.json` updated to:
+```
+{"/World/Camera1": "RoomA_Cam2", "/World/Camera2": "RoomA_Cam1",
+ "/World/Camera3": "RoomB_Cam4", "/World/Camera4": "RoomB_Cam3"}
+```
+`ZONE_CENTERS` in `unified_tracking.py` was NOT touched (per the original
+plan - those coordinates are correct, only the camera-prim-to-zone-name
+mapping was wrong).
+
+**Real open caveat, not resolved:** Camera2's pairing with RoomA_Cam1's
+coordinate (22.60, 27.36) is inferred BY ELIMINATION, not empirically
+confirmed - the marker at that exact spot registered 0 magenta pixels on
+EVERY camera in the test, including Camera2. This could mean the
+diagonal-pairing pattern holds and Camera2 just has a narrower FOV/some
+obstruction at that specific point, or it could mean Camera2 is
+genuinely broken/misoriented independent of the naming bug - not
+distinguished yet. If a future run still shows RoomA_Cam1-zone events
+never getting detected even after this mapping fix, treat Camera2 itself
+as suspect next (re-run the diagnostic script with the marker placed at
+a few other points inside Room A to map out what Camera2 can actually
+see), not the mapping again.
+
+**Not yet re-tested with a real fall/loiter run since this fix.**
