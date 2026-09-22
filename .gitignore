@@ -12,19 +12,44 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Large raw scene assets (source FBX exports + textures) - not needed to run/review the code
+# Large raw scene assets (source FBX exports + textures) - not needed to run/review the
+# code, and Mixamo exports aren't clearly redistributable. The derived USD files the
+# pipeline actually produces and the sim actually loads (character rigs, and the small
+# per-clip source files convert_*.py/bind_*.py consume) are kept - see below.
 assets/*.fbx
 assets/*.fbm/
 assets/textures/
 assets/props/
-*.usd
+assets/animations/
+# xbot_idle.usd: dead, nothing references it anymore (unlike xbot_walk.usd, kept
+# because strip_root_motion.py's fix targets it by name)
+assets/xbot_idle.usd
 
 # Debug/diagnostic output - regenerated on every run, not meaningful without the live sim
 debug_captures/
 nav_stack_logs/
-zone_log.json
-checkpoint_log.json
+run_logs/
 
-# Stray backup/unused files
-nav2_params.yamlA
-_unused_run_sim_filtered.bat.txt
+# Per-run identity/state backups written by unified_tracking.py at startup
+run_state_backups/
+
+# Runtime state - all auto-created fresh (empty) on first run by unified_tracking.py
+# itself; see load_authorized_ids()/load_banned_ids()/get_next_id()'s own graceful
+# missing-file handling. Committing these would just commit one specific run's
+# leftover face IDs and event history as if it were the "real" starting state.
+known_faces/
+appearance_profiles.json
+authorized_ids.json
+banned_ids.json
+next_id.txt
+event_log.json
+report.md
+dashboard.db
+
+# Development history not needed to run or review the current system - see
+# dev_archive/README.md for what's in here and why it's kept out of the repo.
+dev_archive/
+
+# Personal running engineering log kept during development - not part of the
+# portfolio-facing repo.
+NOTES.md

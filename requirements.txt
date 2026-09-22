@@ -1,0 +1,13 @@
+# Installed into Isaac Sim's OWN bundled Python (C:\isaacsim\python.bat -m pip install
+# -r requirements.txt), not a separate venv - unified_tracking.py, dashboard.py and the
+# worker scripts all import isaacsim/omni/pxr/carb, which only exist inside that bundled
+# interpreter and are not on PyPI. Isaac Sim 6.0 itself (https://developer.nvidia.com/isaac/sim)
+# is a separate, non-pip install and is assumed already present - this file only covers
+# what's layered on top of it.
+
+opencv-python>=4.8
+numpy>=1.24
+ultralytics>=8.0       # YOLOv8 person detection - yolo_worker.py
+deepface>=0.0.93       # face embedding + re-ID - deepface_worker.py
+fastapi>=0.110
+uvicorn>=0.29           # runs dashboard.py - see run_dashboard.bat
