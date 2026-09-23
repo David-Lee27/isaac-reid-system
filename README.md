@@ -5,7 +5,11 @@ cameras watch a two-room building for falls and loitering, a robot checks
 everyone in at the door, and re-identification (face + clothing) tracks who's
 who as they move, overstay, get helped up, or get turned away.
 
-![Overview: the door counter and a resident going about their day](media/screenshots/overview_checkin.jpg)
+![Overview: multiple residents, visitors and intruders moving through both rooms at once](media/screenshots/overview_populated.png)
+
+[▶ Watch the full playthrough](media/videos/full_playthrough.mp4) (door
+check-in, wandering, a fall, loitering and an intruder denial all playing
+out together in one run).
 
 Developed iteratively over several months as a portfolio project for
 robotics/AI internship applications, with every fix and the bug that
@@ -28,6 +32,9 @@ the robot deals with all of it on its own:
    as one on screen instead of an instant teleport. A flagged person is
    marked with a red ring on the floor at their feet, not a recolor of the
    person themselves.
+
+   ![An intruder gets scanned, denied, plays the angry reaction, then leaves via the sad walk](media/videos/door_denial_demo.gif)
+
 2. **Zone monitoring** — four fixed cameras cover the two rooms. Each
    compares its view to a clean empty-room reference (background subtraction
    with illumination compensation, color and fill filters) and flags
@@ -39,6 +46,9 @@ the robot deals with all of it on its own:
    one of them.
 3. **Fall response** — the robot drives to the fallen person, helps them up
    (get-up animation), then identifies them for an injury log entry.
+
+   ![A fall gets detected, the robot responds and helps the person back up](media/videos/fall_assist_demo.gif)
+
 4. **Loitering response** — the robot tracks the specific person by identity
    (not a one-time coordinate snapshot) the whole way there and re-aims at
    every orbit standpoint, so a search still finds them even if they keep
@@ -76,6 +86,8 @@ The system is organized into four layers:
 - **Output** — event log (`event_log.json`) and a live FastAPI + SQLite
   dashboard (`reporting/dashboard.py`)
 
+![The live dashboard - response times, identification rates and recent events pulled straight from event_log.json](media/screenshots/dashboard.png)
+
 ## Tech stack
 
 Python · NVIDIA Isaac Sim 6.0 · YOLOv8 · DeepFace · OpenCV · FastAPI · SQLite
@@ -109,24 +121,21 @@ interpreter and not a separate venv).
 
 ## Media
 
-- `media/screenshots/` — real captures pulled from the simulation's own debug
-  pipeline (not staged), included above. To add more, run the sim, then look
-  in `debug_captures/` (regenerated every run — not committed, see
-  `.gitignore`) for `*_RAWFRAME.jpg` (zone camera views) and `*_crop.jpg`
-  (the robot's own close-up face scans), and copy the ones you want into
-  `media/screenshots/`.
-- [`media/videos/full_playthrough.mp4`](media/videos/full_playthrough.mp4) —
-  a full run: door check-in, people wandering, a fall, loitering, and an
-  intruder denial all playing out together.
-- [`media/videos/door_denial_demo.mp4`](media/videos/door_denial_demo.mp4) —
-  an intruder gets scanned, denied, plays the angry reaction, then leaves
-  via the sad walk.
-- [`media/videos/fall_assist_demo.mp4`](media/videos/fall_assist_demo.mp4) —
-  a fall gets detected, the robot responds and helps the person back up.
-- A dashboard screenshot: run `run_dashboard.bat`, open
-  <http://127.0.0.1:8000/>, screenshot it, and drop it in
-  `media/screenshots/` too — I can't capture a live browser page myself, only
-  the simulation's own camera frames.
+The door-denial and fall-assist clips are embedded above as GIFs (next to
+the behavior they show) — `media/videos/door_denial_demo.mp4` and
+`fall_assist_demo.mp4` are the same clips at full quality/frame rate if the
+GIF compression is too lossy for a closer look. The full playthrough
+(`full_playthrough.mp4`, ~2.5 minutes) is linked rather than embedded as a
+GIF — long enough that a GIF of the whole thing would be an unreasonably
+large file for what it's worth.
+
+`media/screenshots/` and `media/videos/` are otherwise real captures, not
+staged — screenshots pulled from the simulation's own debug pipeline or a
+direct viewport/dashboard capture, videos recorded directly from a live
+run. To add more screenshots, run the sim, then look in `debug_captures/`
+(regenerated every run — not committed, see `.gitignore`) for
+`*_RAWFRAME.jpg` (zone camera views) and `*_crop.jpg` (the robot's own
+close-up face scans).
 
 ## Repo layout
 
