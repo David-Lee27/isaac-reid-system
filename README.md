@@ -23,14 +23,14 @@ the robot deals with all of it on its own:
    everyone who comes through the front door once (clothing match first,
    then DeepFace face ID). Known-banned IDs are turned away at the door;
    unknown intruders are auto-banned on the spot and turned away too, with a
-   visible reaction beat first — the person plays a dejected "sad idle"
-   animation, then turns and leaves using a distinct "sad walk," so a
-   denial actually reads as one on screen instead of an instant teleport. A
-   flagged person is marked with a red ring on the floor at their feet, not
-   a recolor of the person themselves.
+   visible reaction beat first — the person plays an "angry" animation, then
+   turns and leaves using a distinct "sad walk," so a denial actually reads
+   as one on screen instead of an instant teleport. A flagged person is
+   marked with a red ring on the floor at their feet, not a recolor of the
+   person themselves.
 2. **Zone monitoring** — four fixed cameras cover the two rooms. Each
    compares its view to a clean empty-room reference (background subtraction
-   with illumination compensation, colour and fill filters) and flags
+   with illumination compensation, color and fill filters) and flags
    **falls** (person-shaped blob with a fall silhouette, or motionless for
    several sweeps regardless of viewing angle) and **loitering** (presence
    over consecutive sweeps). Two cameras per room are de-duplicated so one
@@ -42,12 +42,11 @@ the robot deals with all of it on its own:
 4. **Loitering response** — the robot tracks the specific person by identity
    (not a one-time coordinate snapshot) the whole way there and re-aims at
    every orbit standpoint, so a search still finds them even if they keep
-   wandering during the chase. Each identified loiterer is tracked by ID;
-   after repeated loitering, that ID gets banned and escorted out — a single
-   incident gets a warning and an escort, not an instant permanent ban,
-   since ordinary ambient wandering trips the loitering threshold often
-   enough that a one-strike policy emptied the building out within the
-   first two minutes of testing it.
+   wandering during the chase. Each identified loiterer is tracked by ID
+   across incidents; a single incident gets a warning and an escort, and the
+   ID gets banned only after repeated loitering. (An instant one-strike ban
+   was tried and dropped — ordinary ambient wandering trips the loitering
+   threshold often enough that it emptied the building within two minutes.)
 5. **Time limit** — the robot remembers when each ID first arrived; anyone
    over the visit limit (60 s in this demo) is found and escorted out — never
    while they're still down and waiting to be helped up.
@@ -147,8 +146,8 @@ reporting/
   analyze_run.py         Cross-checks a run against Kit's own engine log, independent of the event log
 
 pipeline/                One-time animation setup - convert an FBX to USD, then bind it onto each character
-  bind_fall_animation.py, bind_get_up_animation.py, bind_idle_animations.py, bind_sad_clips.py
-  convert_fall_clip.py, convert_get_up_clip.py, convert_idle_clips.py, convert_sad_walk.py
+  bind_fall_animation.py, bind_get_up_animation.py, bind_idle_animations.py, bind_denial_reaction_clips.py
+  convert_fall_clip.py, convert_get_up_clip.py, convert_idle_clips.py, convert_angry_clip.py, convert_sad_walk.py
   strip_root_motion.py           removes a walk clip's baked-in forward travel
   fix_idle_translations.py       repair for an earlier bind_idle_animations.py bug (already applied)
   fix_fall_translation_and_hold.py

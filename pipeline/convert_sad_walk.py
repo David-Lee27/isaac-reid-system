@@ -2,16 +2,17 @@ r"""
 convert_sad_walk.py
 
 Converts the Sad Walk FBX to USD only (the Sad Idle clip already converted and
-bound cleanly via bind_sad_clips.py in one pass, but running the FBX->USD async
-converter task and then immediately synchronously opening stages in the same
-script/event-loop corrupted the converter's second call - "no running event
-loop"/"Cannot enter into task" - so, same as this project's existing idle-clip
-pipeline (convert_idle_clips.py is its own separate run from
-bind_idle_animations.py), conversion gets its own dedicated script/process.
+bound cleanly via bind_denial_reaction_clips.py in one pass, but running the
+FBX->USD async converter task and then immediately synchronously opening
+stages in the same script/event-loop corrupted the converter's second call -
+"no running event loop"/"Cannot enter into task" - so, same as this project's
+existing idle-clip pipeline (convert_idle_clips.py is its own separate run
+from bind_idle_animations.py) and the Angry clip (convert_angry_clip.py),
+conversion gets its own dedicated script/process.
 
-Run from PowerShell, THEN run bind_sad_clips.py again afterward (it skips any
-clip it already successfully bound - see its CLIPS list):
-    C:\isaacsim\python.bat C:\isaacsim\projects\surveillance-proj\convert_sad_walk.py
+Run from PowerShell, THEN run bind_denial_reaction_clips.py again afterward
+(it skips any clip it already successfully bound - see its CLIPS list):
+    C:\isaacsim\python.bat C:\isaacsim\projects\surveillance-proj\pipeline\convert_sad_walk.py
 """
 import asyncio
 from isaacsim import SimulationApp

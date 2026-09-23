@@ -1,17 +1,22 @@
 r"""
-bind_sad_clips.py
+bind_denial_reaction_clips.py
 
-Converts and binds the 2 new "denied at the door" reaction clips (user-supplied
-Mixamo FBXs, dropped into assets/): Sad Idle (a beat where the reaction to being
-turned away actually registers before they turn to leave) and Sad Walk (used for
+Converts and binds the "denied at the door" reaction clips (user-supplied
+Mixamo FBXs, dropped into assets/): Angry (the reaction beat that plays the
+instant someone is turned away, before they turn to leave - replaces Sad Idle
+here per explicit direction, "use the angry one... instead of the sad one when
+getting rejected because it looks better"), Sad Idle (kept bound and available,
+just no longer the default reaction clip used for this), and Sad Walk (used for
 the walk out itself, instead of the normal walk clip, per explicit direction -
 "i want to see it... play the animation and then they walk out so people can see
-that theirs something wrong with them and they leave rejected").
+that theirs something wrong with them and they leave rejected" - and, on which
+clip plays which beat, "only use that one when they are getting rejected, when
+walkign away use the sad one").
 
-Sad Idle is bound exactly like the existing idle/social clips (see
-bind_idle_animations.py): every joint held at the walk clip's own rest-pose
-translation (the rig's real bone offsets - only ROTATIONS animate the gesture),
-because it's a stationary pose.
+Angry and Sad Idle are both bound exactly like the existing idle/social clips
+(see bind_idle_animations.py): every joint held at the walk clip's own
+rest-pose translation (the rig's real bone offsets - only ROTATIONS animate
+the gesture), because they're stationary poses.
 
 Sad Walk is NOT bound that way, on purpose: a walk clip's per-joint
 TRANSLATIONS are what actually swing the legs frame to frame, so holding them
@@ -24,12 +29,12 @@ drift across samples - same targeted technique as strip_root_motion.py used for
 the main walk clip - so the character doesn't slide across the floor under our
 own position-driven movement while the legs still swing naturally.
 
-Edits each assets\character*.usd file IN PLACE, adding "mixamo_sad_idle" and
-"mixamo_sad_walk" SkelAnimation clips alongside the existing ones. Does not
-touch any Skeleton's current animationSource binding.
+Edits each assets\character*.usd file IN PLACE, adding "mixamo_angry_reaction",
+"mixamo_sad_idle" and "mixamo_sad_walk" SkelAnimation clips alongside the
+existing ones. Does not touch any Skeleton's current animationSource binding.
 
 Run from PowerShell:
-    C:\isaacsim\python.bat C:\isaacsim\projects\surveillance-proj\bind_sad_clips.py
+    C:\isaacsim\python.bat C:\isaacsim\projects\surveillance-proj\pipeline\bind_denial_reaction_clips.py
 """
 import os
 import re
@@ -44,10 +49,12 @@ ASSETS_DIR = r"C:\isaacsim\projects\surveillance-proj\assets"
 TARGET_FILES = ["character.usd", "character_1.usd", "character_2.usd", "character_3.usd", "character_4.usd"]
 
 # (already-converted source usd, new clip name on each character, is a locomotion clip)
-# Conversion (FBX->USD) is a separate script (convert_sad_walk.py) - see its own
-# docstring for why mixing the async converter with this script's synchronous
-# stage-opening in one process corrupted the converter's event loop.
+# Conversion (FBX->USD) is a separate script per clip (convert_angry_clip.py,
+# convert_sad_walk.py) - see either one's own docstring for why mixing the
+# async converter with this script's synchronous stage-opening in one process
+# corrupted the converter's event loop.
 CLIPS = [
+    ("angry_reaction_clip_source.usd", "mixamo_angry_reaction", False),
     ("sad_idle_clip_source.usd", "mixamo_sad_idle", False),
     ("sad_walk_clip_source.usd", "mixamo_sad_walk", True),
 ]
@@ -168,7 +175,7 @@ def main():
     context = omni.usd.get_context()
     for usd_name, clip_name, is_locomotion in CLIPS:
         if not os.path.exists(f"{ASSETS_DIR}\\{usd_name}"):
-            print(f"[SKIP] {usd_name} not converted yet - run convert_sad_walk.py first.")
+            print(f"[SKIP] {usd_name} not converted yet - run convert_angry_clip.py / convert_sad_walk.py first.")
             continue
         joints, data = get_real_clip_data(context, usd_name)
         print(f"\n=== Binding '{clip_name}' (locomotion={is_locomotion}) ===")

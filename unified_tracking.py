@@ -1,13 +1,21 @@
 r"""
-Unified tracking + movement loop.
-People continuously patrol their waypoint loop WHILE the system sweeps all
-4 zone cameras + checkpoint camera for detection/re-ID/authorization/fall
-detection/loitering, all in one running Isaac Sim instance.
+unified_tracking.py - the whole simulation: scene setup, character movement,
+zone-camera detection, and the robot's own decision-making, all in one
+running Isaac Sim instance. See the repo's README.md for what the system
+actually does; this docstring is just how to run it.
+
+Four fixed zone cameras watch two rooms for falls and loitering. Simulated
+people wander the building, check in with the robot at the front door, idle,
+occasionally fall or overstay, and get identified by face and clothing.
+Everything the robot does - checking someone in, helping a fallen person up,
+chasing down a loiterer, escorting someone out - runs from this one file's
+main loop.
 
 Press Ctrl+C to stop.
 
-Run from PowerShell:
-    C:\isaacsim\python.bat C:\isaacsim\projects\surveillance-proj\unified_tracking.py
+Normally launched via run_simulation.bat (handles a console-buffering issue
+plain python.bat doesn't - see that file's own comment), not directly:
+    C:\isaacsim\projects\surveillance-proj\run_simulation.bat
 """
 
 USD_STAGE_PATH = r"C:\Users\popli\isaacsim\scenes\optimized room.usd"  # real filename has a SPACE, not an underscore - confirmed from the Isaac Sim title bar
@@ -65,6 +73,8 @@ CHECKPOINT_AVAILABLE = False
 
 SCAN_INTERVAL_SECONDS = 8   # how often to run a full camera sweep
 LOITER_THRESHOLD = 3        # consecutive same-zone sightings to flag loitering
+LOITER_STRIKES_BEFORE_BAN = 3  # separate loitering incidents (see the per-person dedup in run_sweep) an identified ID can rack up before getting banned and escorted out for good this run - not an instant one-strike ban, since ordinary ambient wandering trips the loitering threshold often enough that a one-strike policy emptied the building out within 2 minutes of testing it
+LOITER_MIN_SECONDS_BETWEEN_STRIKES = 30.0  # the per-person dispatch dedup (LOITER_DISPATCH_COOLDOWN, in run_sweep) only stops a NEW alert from being created while one's still fresh - it doesn't stop the robot from processing a backlog of already-created, legitimately-separate alerts in a rapid real-time burst once it catches up. Without this floor, a burst like that counted several strikes in under a second and banned someone almost instantly.
 ZONE_SCAN_RESOLUTION = (1280, 960)  # bumped from 640x480 - see scan_zone_camera()'s docstring; a bigger real pixel footprint makes the background-subtraction blob signal much less dominated by render/shadow noise at extreme zone-camera range
 
 # --- People + patrol path ---
@@ -290,7 +300,7 @@ INTRUDER_RETRY_DELAY = 90.0     # seconds before a turned-away intruder tries th
 # used to be.
 CHECKPOINT_POS = (37.6, 18.43)  # centered inside the reception counter's cavity, facing the door
 CHECKPOINT_SCAN_INTERVAL = 5.0  # seconds between check-in scan attempts on whoever's currently waiting at the gate (retry throttle for a "no clear face yet" read, not a re-scan of already-checked-in people - see update_robot's checkpoint-arrival handling)
-DENIAL_REACTION_SECONDS = 2.5  # how long a denied entrant plays the sad-idle reaction before turning to leave - see the checkpoint denial branch
+DENIAL_REACTION_SECONDS = 2.5  # how long a denied entrant plays the angry reaction before turning to leave - see the checkpoint denial branch
 
 
 # The dividing wall between the two rooms is two solid segments with a
@@ -1184,9 +1194,10 @@ IDLE_CLIP_NAMES = ["mixamo_idle_stand", "mixamo_idle_salute", "mixamo_idle_excit
 
 def get_named_clip(model_prim, clip_name):
     """A single named SkelAnimation clip's path for this character, or None if
-    bind_sad_clips.py hasn't been run against it yet - callers must treat that
-    as "capability absent" and fall back gracefully, same convention as the
-    get-up clip's own None handling."""
+    the pipeline script that binds it (e.g. bind_denial_reaction_clips.py)
+    hasn't been run against it yet - callers must treat that as "capability
+    absent" and fall back gracefully, same convention as the get-up clip's
+    own None handling."""
     if not model_prim.IsValid():
         return None
     stage = model_prim.GetStage()
@@ -2245,10 +2256,10 @@ def attempt_robot_scan(robot_state, camera_path, authorized_ids, banned_ids, ale
             if mover is not None and owner_name is not None and owner_name != mover["name"]:
                 # Two different people can't be the same identity. The face
                 # embeddings of this project's synthetic characters (the two
-                # red-tinted intruders especially) get confused often enough
-                # that a "match" to someone else's id is really a matching
-                # error - seen live: an intruder matched a resident's id and
-                # got that resident's identity auto-banned.
+                # intruders especially) get confused often enough that a
+                # "match" to someone else's id is really a matching error -
+                # seen live: an intruder matched a resident's id and got
+                # that resident's identity auto-banned.
                 print(f"  [ROBOT] face matched {person_id}, but that id belongs to {owner_name}, not "
                       f"{mover['name']} - treating it as a face-match error")
                 status = "new"
@@ -3247,26 +3258,54 @@ def update_robot(robot_state, elapsed, authorized_ids, banned_ids):
             # fresh at the start of every run (see main()'s startup reset), a
             # run can't permanently run out of people to a backlog of old
             # bans the way it would if that state persisted forever.
-            LOITER_STRIKES_BEFORE_BAN = 3
             if alert.get("reason") == "loitering":
                 loiter_id = robot_state.get("last_identified_id")
                 if loiter_id and target_mover is not None and not target_mover.get("should_despawn"):
-                    strikes = _tick_state.setdefault("loiter_strikes", {})
-                    strikes[loiter_id] = strikes.get(loiter_id, 0) + 1
-                    count = strikes[loiter_id]
-                    if count >= LOITER_STRIKES_BEFORE_BAN and loiter_id not in banned_ids:
-                        banned_ids.append(loiter_id)
-                        with open(BANNED_IDS_FILE, "w") as f:
-                            json.dump({"banned": banned_ids}, f, indent=2)
-                        print(f"  [ROBOT] *** {loiter_id} flagged as banned - caught loitering {count} times ***")
-                        append_log_entry({
-                            "event_type": "intruder_alert", "person_id": loiter_id,
-                            "zone": alert.get("zone"), "coords": alert.get("coords"),
-                            "timestamp": datetime.now(timezone.utc).isoformat()
-                        })
+                    if loiter_id in banned_ids:
+                        # Already banned from an earlier incident this run - still
+                        # escorted out every time, just no repeat ban/log noise.
+                        print(f"  [ROBOT] {target_mover['name']} ({loiter_id}) is already banned - escorting out")
                     else:
-                        print(f"  [ROBOT] {target_mover['name']} ({loiter_id}) caught loitering "
-                              f"({count}/{LOITER_STRIKES_BEFORE_BAN} before a ban) - escorting out to cool off")
+                        # BUG (found live: a resident hit the strike threshold within
+                        # UNDER A SECOND of real time despite the per-person dispatch
+                        # dedup in run_sweep) - dedup only stops a SECOND alert from
+                        # being CREATED for the same ongoing episode; it doesn't stop
+                        # several already-created, already-legitimate alerts from a
+                        # BACKLOG (the robot busy with something else for a while)
+                        # from all getting worked through in a rapid real-time burst
+                        # once it's free - each one genuinely was a separate creation
+                        # event, but processed back-to-back they don't read as
+                        # separate INCIDENTS the way a person would judge them. Real
+                        # fix: require actual real-world time to have passed since
+                        # the last COUNTED strike, enforced right here at the count
+                        # site - immune to how bursty the robot's own queue
+                        # processing happens to be.
+                        strike_times = _tick_state.setdefault("loiter_strike_times", {})
+                        last_strike = strike_times.get(loiter_id, -1e9)
+                        if time.time() - last_strike < LOITER_MIN_SECONDS_BETWEEN_STRIKES:
+                            # Same incident as the one just counted, not a new one -
+                            # still escorted out below like every other case here,
+                            # just doesn't advance the strike count.
+                            print(f"  [ROBOT] {target_mover['name']} ({loiter_id}) caught loitering again so "
+                                  f"soon after the last one - same incident, not a new strike - escorting out")
+                        else:
+                            strike_times[loiter_id] = time.time()
+                            strikes = _tick_state.setdefault("loiter_strikes", {})
+                            strikes[loiter_id] = strikes.get(loiter_id, 0) + 1
+                            count = strikes[loiter_id]
+                            if count >= LOITER_STRIKES_BEFORE_BAN:
+                                banned_ids.append(loiter_id)
+                                with open(BANNED_IDS_FILE, "w") as f:
+                                    json.dump({"banned": banned_ids}, f, indent=2)
+                                print(f"  [ROBOT] *** {loiter_id} flagged as banned - caught loitering {count} times ***")
+                                append_log_entry({
+                                    "event_type": "intruder_alert", "person_id": loiter_id,
+                                    "zone": alert.get("zone"), "coords": alert.get("coords"),
+                                    "timestamp": datetime.now(timezone.utc).isoformat()
+                                })
+                            else:
+                                print(f"  [ROBOT] {target_mover['name']} ({loiter_id}) caught loitering "
+                                      f"({count}/{LOITER_STRIKES_BEFORE_BAN} before a ban) - escorting out to cool off")
                     target_mover["paused_until"] = 0
                     target_mover["is_visitor"] = True
                     target_mover["visitor_state"] = "exiting"
@@ -3372,14 +3411,21 @@ def update_robot(robot_state, elapsed, authorized_ids, banned_ids):
                             # robot turns them away immediately i want to see it...
                             # play the animation and then they walk out so people
                             # can see that theirs something wrong with them") - a
-                            # visible reaction beat (sad idle) before they turn to
-                            # leave, then the walk out itself uses a sad walk clip
-                            # instead of the normal one. Falls back to the old
-                            # instant walk-out if this character has no sad clips
-                            # bound (bind_sad_clips.py not run against it yet).
-                            sad_idle = entrant.get("sad_idle_clip_path")
-                            if sad_idle is not None and entrant.get("skel_prim") is not None:
-                                set_animation_clip(entrant["skel_prim"], sad_idle)
+                            # visible reaction beat before they turn to leave, then
+                            # the walk out itself uses a sad walk clip instead of
+                            # the normal one. The reaction beat plays the angry
+                            # clip (per explicit direction - "use the angry one...
+                            # instead of the sad one when getting rejected because
+                            # it looks better"; the sad-idle clip this replaced
+                            # here is unused for the reaction now, but the sad WALK
+                            # clip stays for the walk-out itself per direction -
+                            # "when walkign away use the sad one"). Falls back to
+                            # the old instant walk-out if this character has
+                            # neither an angry nor a sad-idle clip bound (the
+                            # pipeline scripts haven't been run against it yet).
+                            reaction_clip = entrant.get("angry_clip_path") or entrant.get("sad_idle_clip_path")
+                            if reaction_clip is not None and entrant.get("skel_prim") is not None:
+                                set_animation_clip(entrant["skel_prim"], reaction_clip)
                                 # BUG (found live: the reaction pose was overwritten and
                                 # walking resumed only ~300ms later, not after the full
                                 # reaction beat) - paused_until is ALSO written by the
@@ -3879,6 +3925,8 @@ _fall_camera_room = {}       # camera_path -> "RoomA"/"RoomB" (so a room's camer
 _last_fall_dispatch = {}     # room -> time.time() of the last fall dispatch_alert created for it
 _last_fall_dispatch_coords = {}  # room -> (x, y, time.time()) of the last fall dispatch's target, for cross-room misattribution checks (see below)
 _fall_dup_noted = {}          # camera_path -> a held duplicate detection was already announced this episode
+_last_loiter_dispatch = {}    # mover_name -> time.time() of their last loitering dispatch (see the dedup above)
+LOITER_DISPATCH_COOLDOWN = 45.0  # generous on purpose - a real loitering EPISODE naturally runs longer than a fall does, this only needs to outlast the gap between two cameras both catching the SAME episode
 FALL_DISPATCH_COOLDOWN = 10.0  # short on purpose: the sibling-camera check covers real duplicates; a long cooldown let a false alarm swallow the next real fall (seen live: 24s later)
 _zone_empty_streaks = {}  # camera_path -> consecutive not-detected reads, see the adaptive-reference BUG comment
 
@@ -3961,9 +4009,9 @@ def find_zone_blobs(gray, reference, bgr):
     floor through (measured: blobs up to ~250,000px, one of which read as
     a "fallen person" and dispatched the robot to nobody, repeatedly). But
     this scene's walls and floor are achromatic gray while every person -
-    blue, tan, the red-tinted intruders - wears saturated colour. Measured
-    over ~100 blobs: floor residue had exactly 0 coloured pixels, real
-    people had a median ~46% coloured."""
+    whatever colour clothing they're wearing - has real saturated colour in
+    frame. Measured over ~100 blobs: floor residue had exactly 0 coloured
+    pixels, real people had a median ~46% coloured."""
     compensated = compensate_reference(reference, gray)
     diff = cv2.absdiff(gray, compensated)
     _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
@@ -4639,7 +4687,22 @@ def run_sweep(camera_zones, authorized_ids, banned_ids, streak_state, movers, el
             nearest_mover = get_nearest_mover(movers, zone_name)
             coords = clamp_to_floor(nearest_mover["logical_x"], nearest_mover["logical_y"]) if nearest_mover else get_nearest_mover_coords(movers, zone_name)
             mover_name = nearest_mover["name"] if nearest_mover else None
-            print(f"  [{zone_name}] *** LOITERING (someone present {LOITER_THRESHOLD}+ sweeps in a row) ***")
+            # BUG (found live: a resident racked up 3 loitering "incidents" -
+            # enough to trigger a ban - within 14 real seconds, nowhere near
+            # enough time for 3 GENUINELY separate episodes at ~8s/sweep):
+            # check_loitering's own one-shot "alerted" flag is keyed per
+            # CAMERA, not per person - two cameras covering the same room can
+            # both be watching the same person and independently cross their
+            # own 3-sweep threshold within moments of each other, each firing
+            # its own dispatch for what is really ONE ongoing episode. Same
+            # class of bug already found and fixed for falls (see
+            # _fall_alerted_zones's own history) - fix the same way, keyed on
+            # the actual person this time (mover_name is already resolved,
+            # more precise than the coordinate-proximity guard falls needed).
+            recently_dispatched = mover_name is not None and (
+                time.time() - _last_loiter_dispatch.get(mover_name, -1e9) < LOITER_DISPATCH_COOLDOWN)
+            print(f"  [{zone_name}] *** LOITERING (someone present {LOITER_THRESHOLD}+ sweeps in a row) ***"
+                  + (" (already reported for this person recently - no new dispatch)" if recently_dispatched else ""))
             # BUG (reported live: "people who freeze like... just stand
             # there walking and not moving an inch... keeps happening") -
             # this camera-side detection used to call pause_nearest_mover()
@@ -4666,16 +4729,19 @@ def run_sweep(camera_zones, authorized_ids, banned_ids, streak_state, movers, el
                 "coords": coords,
                 "timestamp": timestamp
             })
-            append_log_entry({
-                "event_type": "dispatch_alert",
-                "alert_id": next_alert_id(),
-                "reason": "loitering",
-                "person_id": None,
-                "mover_name": mover_name,
-                "zone": zone_name,
-                "coords": coords,
-                "timestamp": timestamp
-            })
+            if not recently_dispatched:
+                if mover_name is not None:
+                    _last_loiter_dispatch[mover_name] = time.time()
+                append_log_entry({
+                    "event_type": "dispatch_alert",
+                    "alert_id": next_alert_id(),
+                    "reason": "loitering",
+                    "person_id": None,
+                    "mover_name": mover_name,
+                    "zone": zone_name,
+                    "coords": coords,
+                    "timestamp": timestamp
+                })
 
         append_log_entry({
             "event_type": "zone",
@@ -4772,8 +4838,11 @@ def spawn_visitor(stage, elapsed):
         "visitor_entry_target": (entry_x, entry_y), "visitor_exit_final": False,
         "should_despawn": False, "checked_in": False,
         # See the door-denial reaction sequence in update_robot's checkpoint
-        # branch: sad_idle plays as a visible reaction beat, then sad_walk
-        # replaces walk_clip_path (restored on despawn/revive) for the walk out.
+        # branch: the angry clip plays as a visible reaction beat (looks
+        # better than the sad-idle pose it replaced there - the sad-idle
+        # clip is kept for the walk-out beat below), then sad_walk replaces
+        # walk_clip_path (restored on despawn/revive) for the walk out.
+        "angry_clip_path": get_named_clip(model_prim, "mixamo_angry_reaction"),
         "sad_idle_clip_path": get_named_clip(model_prim, "mixamo_sad_idle"),
         "sad_walk_clip_path": get_named_clip(model_prim, "mixamo_sad_walk"),
         "normal_walk_clip_path": walk_clip_path, "pending_denied_exit": False,
@@ -4880,6 +4949,7 @@ def spawn_intruder(stage, elapsed, prim_path, asset_path, name):
         "is_visitor": True, "visitor_state": "entering", "visit_end_time": None,
         "visitor_entry_target": (entry_x, entry_y), "visitor_exit_final": False,
         "should_despawn": False, "checked_in": False, "is_intruder": True,
+        "angry_clip_path": get_named_clip(model_prim, "mixamo_angry_reaction"),
         "sad_idle_clip_path": get_named_clip(model_prim, "mixamo_sad_idle"),
         "sad_walk_clip_path": get_named_clip(model_prim, "mixamo_sad_walk"),
         "normal_walk_clip_path": walk_clip_path, "pending_denied_exit": False,
@@ -5127,6 +5197,7 @@ def main():
             "logical_x": spawn_x, "logical_y": spawn_y,  # see set_person_translate()'s docstring - the TRUE position, distinct from mover["prim"]'s own offset-compensated translate
             "wander_waypoint": None, "last_wander_move_time": None,  # ambient wandering - see update_person_position
             "idle_clips": idle_clips, "idling": False,  # see IDLE_PAUSE_CHANCE
+            "angry_clip_path": get_named_clip(model_prim, "mixamo_angry_reaction"),
             "sad_idle_clip_path": get_named_clip(model_prim, "mixamo_sad_idle"),
             "sad_walk_clip_path": get_named_clip(model_prim, "mixamo_sad_walk"),
             "normal_walk_clip_path": walk_clip_path, "pending_denied_exit": False,
