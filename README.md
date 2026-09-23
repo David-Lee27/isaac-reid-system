@@ -115,6 +115,9 @@ interpreter and not a separate venv).
   `.gitignore`) for `*_RAWFRAME.jpg` (zone camera views) and `*_crop.jpg`
   (the robot's own close-up face scans), and copy the ones you want into
   `media/screenshots/`.
+- [`media/videos/full_playthrough.mp4`](media/videos/full_playthrough.mp4) —
+  a full run: door check-in, people wandering, a fall, loitering, and an
+  intruder denial all playing out together.
 - [`media/videos/door_denial_demo.mp4`](media/videos/door_denial_demo.mp4) —
   an intruder gets scanned, denied, plays the angry reaction, then leaves
   via the sad walk.
