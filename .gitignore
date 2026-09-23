@@ -53,3 +53,8 @@ dev_archive/
 # Personal running engineering log kept during development - not part of the
 # portfolio-facing repo.
 NOTES.md
+
+# Throwaway per-scenario recording helpers - monkeypatch unified_tracking's
+# own tunables to isolate/speed up one behavior at a time for demo videos,
+# not meant to ship as part of the project.
+demo_scenarios/

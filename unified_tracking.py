@@ -4517,7 +4517,18 @@ def scan_zone_camera(camera_path, zone_name, movers, robot_prim=None):
                 "timestamp": datetime.now(timezone.utc).isoformat()
             })
             _last_fall_dispatch[room] = time.time()
-            _last_fall_dispatch_coords[room] = (candidate_coords[0], candidate_coords[1], time.time()) if candidate_coords else _last_fall_dispatch_coords.get(room)
+            # BUG (crashed live: "TypeError: cannot unpack non-iterable NoneType
+            # object" in the cross-room coords-match loop above): this used to fall
+            # back to `_last_fall_dispatch_coords.get(room)` when candidate_coords
+            # was falsy, which is a harmless no-op re-assignment IF this room
+            # already had a real tuple stored - but on this room's FIRST EVER fall
+            # dispatch with no real candidate mover nearby (an empty/false-alarm
+            # room), .get(room) returns None, so None got written into the dict as
+            # if it were a coordinate tuple. The loop above unpacks every value as
+            # (rx, ry, rt) and crashed on it. Simplest correct fix: only ever write
+            # a real tuple here, never touch the dict at all otherwise.
+            if candidate_coords:
+                _last_fall_dispatch_coords[room] = (candidate_coords[0], candidate_coords[1], time.time())
             append_log_entry({
                 "event_type": "dispatch_alert",
                 "alert_id": next_alert_id(),

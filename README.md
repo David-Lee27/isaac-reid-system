@@ -115,10 +115,11 @@ interpreter and not a separate venv).
   `.gitignore`) for `*_RAWFRAME.jpg` (zone camera views) and `*_crop.jpg`
   (the robot's own close-up face scans), and copy the ones you want into
   `media/screenshots/`.
-- `media/videos/` — put a screen recording here (e.g. `demo.mp4`) and link it
-  from this section once you have one. Record with `SIM_RECORDING_MODE=1`
-  set (see **Running it** above) so the disk I/O from diagnostic captures
-  doesn't fight your recorder for bandwidth.
+- [`media/videos/door_denial_demo.mp4`](media/videos/door_denial_demo.mp4) —
+  an intruder gets scanned, denied, plays the angry reaction, then leaves
+  via the sad walk.
+- [`media/videos/fall_assist_demo.mp4`](media/videos/fall_assist_demo.mp4) —
+  a fall gets detected, the robot responds and helps the person back up.
 - A dashboard screenshot: run `run_dashboard.bat`, open
   <http://127.0.0.1:8000/>, screenshot it, and drop it in
   `media/screenshots/` too — I can't capture a live browser page myself, only
