@@ -222,18 +222,6 @@ COUNTER_VIA_SOUTH = [(38.9, 16.4), (36.6, 16.4)]
 STARTUP_LOAD_SECONDS = 30.0  # scene/models settle before anything moves or gets timed
 DOOR_POS = (41.5, 18.43)  # a few meters past the gap, fully outside the building
 VISITOR_ASSET_PATH = r"C:\isaacsim\projects\surveillance-proj\assets\character_4.usd"
-# All 5 character files are the same Mixamo rig topology and already carry
-# the full animation set (walk/fall/get-up/idle/sad/angry - see the
-# pipeline/ scripts, which bind every clip onto all 5 by design), so any of
-# them is a safe stand-in for a visitor - not just VISITOR_ASSET_PATH alone,
-# which made every single ambient visitor a visual clone of one another.
-VISITOR_ASSET_POOL = [
-    PROJECT_DIR + r"\assets\character.usd",
-    PROJECT_DIR + r"\assets\character_1.usd",
-    PROJECT_DIR + r"\assets\character_2.usd",
-    PROJECT_DIR + r"\assets\character_3.usd",
-    PROJECT_DIR + r"\assets\character_4.usd",
-]
 VISITOR_SPAWN_INTERVAL_RANGE = (25.0, 50.0)  # seconds between new visitor spawn attempts
 MAX_CONCURRENT_VISITORS = 2
 VISIT_DURATION_RANGE = (30.0, 70.0)  # seconds a visitor stays inside before heading back to the door
@@ -4529,18 +4517,7 @@ def scan_zone_camera(camera_path, zone_name, movers, robot_prim=None):
                 "timestamp": datetime.now(timezone.utc).isoformat()
             })
             _last_fall_dispatch[room] = time.time()
-            # BUG (crashed live: "TypeError: cannot unpack non-iterable NoneType
-            # object" in the cross-room coords-match loop above): this used to fall
-            # back to `_last_fall_dispatch_coords.get(room)` when candidate_coords
-            # was falsy, which is a harmless no-op re-assignment IF this room
-            # already had a real tuple stored - but on this room's FIRST EVER fall
-            # dispatch with no real candidate mover nearby (an empty/false-alarm
-            # room), .get(room) returns None, so None got written into the dict as
-            # if it were a coordinate tuple. The loop above unpacks every value as
-            # (rx, ry, rt) and crashed on it. Simplest correct fix: only ever write
-            # a real tuple here, never touch the dict at all otherwise.
-            if candidate_coords:
-                _last_fall_dispatch_coords[room] = (candidate_coords[0], candidate_coords[1], time.time())
+            _last_fall_dispatch_coords[room] = (candidate_coords[0], candidate_coords[1], time.time()) if candidate_coords else _last_fall_dispatch_coords.get(room)
             append_log_entry({
                 "event_type": "dispatch_alert",
                 "alert_id": next_alert_id(),
@@ -4783,12 +4760,11 @@ _visitor_spawn_count = 0  # module-level counter for unique visitor prim paths/n
 def spawn_visitor(stage, elapsed):
     """Creates one new transient 'visitor' mover at DOOR_POS, for the
     "people come in and out all the time like a real area" ambient
-    population request. Same reference-a-Mixamo-asset pattern as Person4
-    (see that block's comments for why the ops go where they go), but
-    picks randomly from VISITOR_ASSET_POOL (all 5 character files) rather
-    than a single fixed asset - BUG (found live: "why is it just the same
-    person", every ambient visitor was a visual clone of every other one,
-    all hardcoded to character_4.usd).
+    population request. Same reference-a-spare-Mixamo-asset pattern as
+    Person4 (see that block's comments for why the ops go where they go -
+    character_4.usd needs the identical treatment, it's from the same
+    export pipeline), using character_4.usd (the last remaining unused
+    spare asset) instead so visitors don't look identical to Person4.
 
     Deliberately does NOT give visitors a fall_clip/get_up_clip binding -
     they only ever wander/loiter/get identified, never scripted-fall, so
@@ -4812,7 +4788,7 @@ def spawn_visitor(stage, elapsed):
     UsdGeom.Xformable(prim).AddTranslateOp().Set(Gf.Vec3d(0, 0, 1))  # same z=1 convention as every other character here
     model_prim = stage.DefinePrim(prim_path + "/model", "Xform")
     ref_prim = stage.DefinePrim(prim_path + "/model/character_ref", "Xform")
-    ref_prim.GetReferences().AddReference(random.choice(VISITOR_ASSET_POOL))
+    ref_prim.GetReferences().AddReference(VISITOR_ASSET_PATH)
     model_xf = UsdGeom.Xformable(model_prim)
     model_xf.AddTranslateOp().Set(Gf.Vec3d(0, 0, 0))
     model_xf.AddRotateXYZOp().Set(Gf.Vec3f(90, 0, 0))
