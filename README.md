@@ -57,7 +57,6 @@ the robot deals with all of it on its own:
    also pause for idle animations (salute, excited, phone call, standing
    idle) between wandering.
 
-![A person down, seen by a zone camera — detected from any angle, not just side-on](media/screenshots/fall_detected.jpg)
 ![The robot's own camera identifying someone at the door — the person keeps their normal appearance; only a red ring at their feet marks them as flagged](media/screenshots/robot_face_scan.jpg)
 
 ## Architecture
