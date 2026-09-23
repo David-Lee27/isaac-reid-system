@@ -180,19 +180,13 @@ assets to reproduce it.
 - A rare, walking pose that briefly holds a stable, wide silhouette can
   register as a false fall alarm
 
-## Roadmap
+## Features
 
-- [x] Door check-in, denial (with a visible reaction) and auto-ban for
+- Door check-in, denial (with a visible reaction) and auto-ban for
   independent intruders
-- [x] Fall detection from any angle, assist, and injury log
-- [x] Loitering detection with continuous identity tracking through the
-  search, escalating to a ban after repeated incidents
-- [x] Overstay tracking and escort, with returning visitors
-- [x] Idle and "denied" reaction animations
-- [x] FastAPI + SQLite backend with live dashboard
-- [ ] Demo video
-
----
-
-*This project is under active development as part of an ongoing internship
-application portfolio.*
+- Fall detection from any angle, assist, and injury log
+- Loitering detection with continuous identity tracking through the search,
+  escalating to a ban after repeated incidents
+- Overstay tracking and escort, with returning visitors
+- Idle and "denied" reaction animations
+- FastAPI + SQLite backend with live dashboard
